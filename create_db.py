@@ -52,7 +52,14 @@ def setup_database_schema():
     cursor.execute("""
     CREATE TABLE IF NOT EXISTS City (
         id SERIAL PRIMARY KEY,
-        name VARCHAR(255) NOT NULL
+        name VARCHAR(255) NOT NULL,
+        name_ru VARCHAR(255) NOT NULL,
+        country VARCHAR(255) NOT NULL,
+        country_ru VARCHAR(255) NOT NULL,
+        foundation TEXT,
+        foundation_ru TEXT,
+        description TEXT,
+        description_ru TEXT
     );
     """)
 
@@ -80,7 +87,9 @@ def setup_database_schema():
         id SERIAL PRIMARY KEY,
         name VARCHAR(255) NOT NULL,
         role VARCHAR(255),
+        role_ru VARCHAR(255),
         description TEXT,
+        description_ru TEXT,
         location GEOMETRY NOT NULL
     );
     """)

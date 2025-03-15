@@ -52,6 +52,70 @@ EXPLICIT_HOUSING = {
     'leisure:park', 'leisure:garden', 'leisure:playground'
 }
 
+# Добавление городов с информацией на английском и русском
+cities_info = [
+    {
+        'name': 'London',
+        'name_ru': 'Лондон',
+        'country': 'United Kingdom',
+        'country_ru': 'Великобритания',
+        'foundation': 'Traditionally 43 AD (Roman Foundation)',
+        'foundation_ru': 'Традиционно 43 год н.э. (Римское основание)',
+        'description': 'London is the capital and largest city of England and the United Kingdom. Known for the arts, commerce, education, and finance.',
+        'description_ru': 'Лондон — столица и крупнейший город Англии и Великобритании. Известен искусством, коммерцией, образованием и финансами.',
+        'start_date': 1500,
+        'end_date': 2050,
+    },
+    {
+        'name': 'Paris',
+        'name_ru': 'Париж',
+        'country': 'France',
+        'country_ru': 'Франция',
+        'foundation': 'Approximately 3rd century BC by the Parisii, a Celtic people',
+        'foundation_ru': 'Около III века до н.э. племенем паризиев, кельтским народом',
+        'description': 'Paris is the capital and most populous city of France. Known for its art, fashion, gastronomy, and culture.',
+        'description_ru': 'Париж — столица и самый густонаселённый город Франции. Известен искусством, модой, гастрономией и культурой.',
+        'start_date': 1500,
+        'end_date': 2050,
+    },
+    {
+        'name': 'Moscow',
+        'name_ru': 'Москва',
+        'country': 'Russia',
+        'country_ru': 'Россия',
+        'foundation': 'Approximately 1147 yesr by Yuri Dolgorukiy',
+        'foundation_ru': 'Около 1147 года н.э. удельным князем Юрием Долгоруким',
+        'description': 'Moscow is the capital and largest city of Russia. Known for its architecture, historic buildings like the Kremlin and Saint Basil’s Cathedral.',
+        'description_ru': 'Москва — столица и крупнейший город России. Известна архитектурой, историческими зданиями, такими как Кремль и Собор Василия Блаженного.',
+        'start_date': 1500,
+        'end_date': 2050,
+    },
+    {
+        'name': 'Rome',
+        'name_ru': 'Рим',
+        'country': 'Italy',
+        'country_ru': 'Италия',
+        'foundation': 'Traditionally 753 BC',
+        'foundation_ru': 'Традиционно 753 год до н.э.',
+        'description': 'Rome is the capital city of Italy, known as the "Eternal City". Famous for its ancient ruins such as the Forum and the Colosseum.',
+        'description_ru': 'Рим — столица Италии, известен как "Вечный город". Знаменит древними руинами, такими как Форум и Колизей.',
+        'start_date': 1500,
+        'end_date': 2050,
+    },
+    {
+        'name': 'Saint Petersburg',
+        'name_ru': 'Санкт-Петербург',
+        'country': 'Russia',
+        'country_ru': 'Россия',
+        'foundation': 'May 27, 1703',
+        'foundation_ru': '27 мая 1703 года',
+        'description': 'Saint Petersburg is a major city in Russia, founded by Tsar Peter the Great. Known for its imperial history and architecture.',
+        'description_ru': 'Санкт-Петербург — крупный город в России, основанный Петром Великим. Известен имперской историей и архитектурой.',
+        'start_date': 1705,
+        'end_date': 2050,
+    },
+]
+
 
 def get_year(date_str):
     """Извлекает год из строки с датой"""
@@ -114,16 +178,18 @@ def determine_mode(role):
 def setup_initial_data(conn):
     """Создает начальные данные: города, режимы и симуляции по годам"""
     cursor = conn.cursor()
-
-    # Добавление городов
-    cities = ['London', 'Paris', 'Moscow', 'Rome', 'Saint Petersburg']
     city_ids = {}
 
-    for city in cities:
-        cursor.execute("INSERT INTO City (name) VALUES (%s) RETURNING id;", (city,))
+    for city_info in cities_info:
+        cursor.execute("""
+            INSERT INTO City (name, name_ru, country, country_ru, foundation, foundation_ru, description, description_ru) 
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+        """, (city_info['name'], city_info['name_ru'], city_info['country'], city_info['country_ru'],
+              city_info['foundation'], city_info['foundation_ru'], city_info['description'], city_info['description_ru']))
+
         city_id = cursor.fetchone()[0]
-        city_ids[city] = city_id
-        print(f"Created city '{city}' with ID: {city_id}")
+        city_ids[city_info['name']] = city_id
+        print(f"Created city '{city_info['name']}' with ID: {city_id}")
 
     # Добавление режимов моделирования
     cursor.execute("INSERT INTO Mode (name) VALUES ('Transport Infrastructure Modeling') RETURNING id;")
@@ -140,28 +206,28 @@ def setup_initial_data(conn):
         'housing': {}
     }
 
-    # Создание симуляций для Лондона в каждом режиме с 1500 по 2020
-    for year in range(1500, 2021):
-        # Симуляция для транспортной инфраструктуры
-        cursor.execute(
-            "INSERT INTO Simulation (city_id, mode_id, year) VALUES (%s, %s, %s) RETURNING id;",
-            (city_ids['London'], transport_mode_id, year)
-        )
-        transport_sim_id = cursor.fetchone()[0]
-        simulation_ids['transport'][year] = transport_sim_id
+    # Создание симуляций для каждого города в каждом режиме с 1500 по 2020
+    for city_info in cities_info:
+        for year in range(city_info['start_date'], city_info['end_date']):
+            # Симуляция для транспортной инфраструктуры
+            cursor.execute(
+                "INSERT INTO Simulation (city_id, mode_id, year) VALUES (%s, %s, %s) RETURNING id;",
+                (city_ids[city_info['name']], transport_mode_id, year)
+            )
+            transport_sim_id = cursor.fetchone()[0]
+            simulation_ids['transport'][year] = transport_sim_id
+            # Симуляция для городской застройки
+            cursor.execute(
+                "INSERT INTO Simulation (city_id, mode_id, year) VALUES (%s, %s, %s) RETURNING id;",
+                (city_ids[city_info['name']], housing_mode_id, year)
+            )
+            housing_sim_id = cursor.fetchone()[0]
+            simulation_ids['housing'][year] = housing_sim_id
 
-        # Симуляция для городской застройки
-        cursor.execute(
-            "INSERT INTO Simulation (city_id, mode_id, year) VALUES (%s, %s, %s) RETURNING id;",
-            (city_ids['London'], housing_mode_id, year)
-        )
-        housing_sim_id = cursor.fetchone()[0]
-        simulation_ids['housing'][year] = housing_sim_id
-
-    print(f"Created simulations for London for years from 1500 to 2020 in both modes")
+        print(f"Created simulations for {city_info['name']} for years from {city_info['start_date']} to {city_info['end_date']} in both modes")
 
     conn.commit()
-    return city_ids['London'], {'transport': transport_mode_id, 'housing': housing_mode_id}, simulation_ids
+    return city_ids, {'transport': transport_mode_id, 'housing': housing_mode_id}, simulation_ids
 
 
 def parse_osm_and_fill_database(osm_file_path, simulation_ids, conn):
@@ -251,8 +317,8 @@ def parse_osm_and_fill_database(osm_file_path, simulation_ids, conn):
                 name = f"{element_type}_{element_id}"
 
             # Определяем годы существования объекта
-            start_year = get_year(start_date) or 1500  # По умолчанию с начала периода
-            end_year = get_year(end_date) or 2020  # По умолчанию до конца периода
+            start_year = get_year(start_date) or 1400  # По умолчанию с начала периода
+            end_year = get_year(end_date) or 2100  # По умолчанию до конца периода
 
             # Определяем, к какому режиму моделирования относится объект
             mode_type = determine_mode(role)
@@ -307,7 +373,7 @@ def parse_osm_and_fill_database(osm_file_path, simulation_ids, conn):
                 geo_object_id = object_cursor.fetchone()[0]
 
                 # Добавляем связи в GeoObjectSimulation для каждого года существования объекта
-                for year in range(max(start_year, 1500), min(end_year + 1, 2021)):
+                for year in range(max(start_year, 1500), min(end_year + 1, 2100)):
                     if year in simulation_ids[mode_type]:
                         object_cursor.execute(
                             "INSERT INTO GeoObjectSimulation (simulation_id, geo_object_id) VALUES (%s, %s);",
