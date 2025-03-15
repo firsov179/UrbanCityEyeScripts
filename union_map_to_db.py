@@ -1,0 +1,365 @@
+import xml.etree.ElementTree as ET
+import psycopg2
+import time
+from collections import defaultdict
+
+# Параметры подключения к PostgreSQL
+db_params = {
+    'host': 'localhost',
+    'user': 'postgres',
+    'password': 'postgres',
+    'database': 'city_simulation_db'
+}
+
+# Определение объектов для каждого режима моделирования
+TRANSPORT_OBJECTS = {
+    'highway', 'railway', 'waterway', 'aeroway', 'ferry', 'public_transport',
+    'building:transportation', 'building:train_station', 'amenity:ferry_terminal',
+    'amenity:bus_station', 'amenity:taxi'
+}
+
+HOUSING_OBJECTS = {
+    'building', 'landuse', 'amenity', 'leisure', 'natural', 'shop', 'tourism',
+    'historic', 'man_made', 'office', 'residential', 'commercial'
+}
+
+# Категории объектов для каждого режима
+TRANSPORT_CATEGORIES = [
+    'highway:', 'railway:', 'waterway:', 'building:transportation', 'building:train_station',
+    'building:train_station; railway:', 'amenity:parking'
+]
+
+HOUSING_CATEGORIES = [
+    'building:', 'landuse:', 'amenity:', 'natural:', 'leisure:',
+    'shop:', 'tourism:', 'historic:'
+]
+
+# Явно определенные категории для транспорта
+EXPLICIT_TRANSPORT = {
+    'amenity:bus_station', 'amenity:ferry_terminal', 'amenity:taxi', 'amenity:charging_station',
+    'amenity:bicycle_parking', 'amenity:bicycle_rental', 'amenity:car_sharing',
+    'amenity:motorcycle_parking', 'building:hangar', 'building:garage', 'building:garages',
+    'building:parking', 'railway:station', 'railway:halt', 'railway:tram_stop', 'railway:subway_entrance'
+}
+
+# Явно определенные категории для жилья
+EXPLICIT_HOUSING = {
+    'building:residential', 'building:apartments', 'building:house', 'building:dormitory',
+    'building:hotel', 'building:office', 'building:commercial', 'building:retail',
+    'amenity:school', 'amenity:hospital', 'amenity:university', 'amenity:college',
+    'amenity:library', 'amenity:theatre', 'amenity:cinema', 'amenity:restaurant', 'amenity:cafe',
+    'amenity:pub', 'amenity:bar', 'amenity:marketplace', 'amenity:place_of_worship',
+    'leisure:park', 'leisure:garden', 'leisure:playground'
+}
+
+
+def get_year(date_str):
+    """Извлекает год из строки с датой"""
+    if not date_str:
+        return None
+
+    sep = date_str.find('-')
+    if sep != -1 and sep != 0:
+        try:
+            return int(date_str[:sep])
+        except ValueError:
+            pass
+
+    try:
+        return int(date_str)
+    except (ValueError, TypeError):
+        return None
+
+
+def determine_mode(role):
+    """Определяет, к какому режиму моделирования относится объект"""
+    if not role:
+        return None
+
+    # Проверяем явно определенные категории
+    if role in EXPLICIT_TRANSPORT:
+        return 'transport'
+
+    if role in EXPLICIT_HOUSING:
+        return 'housing'
+
+    # Проверяем по префиксам для транспорта
+    for category in TRANSPORT_CATEGORIES:
+        if role.startswith(category):
+            return 'transport'
+
+    # Проверяем по префиксам для жилья
+    for category in HOUSING_CATEGORIES:
+        if role.startswith(category):
+            return 'housing'
+
+    # Проверяем по тегам, разделенным через ";"
+    if ";" in role:
+        parts = role.split(";")
+        for part in parts:
+            part = part.strip()
+            # Для транспорта
+            for category in TRANSPORT_CATEGORIES:
+                if part.startswith(category):
+                    return 'transport'
+            # Для жилья
+            for category in HOUSING_CATEGORIES:
+                if part.startswith(category):
+                    return 'housing'
+
+    # По умолчанию относим к жилью
+    return 'housing'
+
+
+def setup_initial_data(conn):
+    """Создает начальные данные: города, режимы и симуляции по годам"""
+    cursor = conn.cursor()
+
+    # Добавление городов
+    cities = ['London', 'Paris', 'Moscow', 'Rome', 'Saint Petersburg']
+    city_ids = {}
+
+    for city in cities:
+        cursor.execute("INSERT INTO City (name) VALUES (%s) RETURNING id;", (city,))
+        city_id = cursor.fetchone()[0]
+        city_ids[city] = city_id
+        print(f"Created city '{city}' with ID: {city_id}")
+
+    # Добавление режимов моделирования
+    cursor.execute("INSERT INTO Mode (name) VALUES ('Transport Infrastructure Modeling') RETURNING id;")
+    transport_mode_id = cursor.fetchone()[0]
+    print(f"Created mode 'Transport Infrastructure Modeling' with ID: {transport_mode_id}")
+
+    cursor.execute("INSERT INTO Mode (name) VALUES ('Housing Development Modeling') RETURNING id;")
+    housing_mode_id = cursor.fetchone()[0]
+    print(f"Created mode 'Housing Development Modeling' with ID: {housing_mode_id}")
+
+    # Создание словаря для хранения ID симуляций
+    simulation_ids = {
+        'transport': {},
+        'housing': {}
+    }
+
+    # Создание симуляций для Лондона в каждом режиме с 1500 по 2020
+    for year in range(1500, 2021):
+        # Симуляция для транспортной инфраструктуры
+        cursor.execute(
+            "INSERT INTO Simulation (city_id, mode_id, year) VALUES (%s, %s, %s) RETURNING id;",
+            (city_ids['London'], transport_mode_id, year)
+        )
+        transport_sim_id = cursor.fetchone()[0]
+        simulation_ids['transport'][year] = transport_sim_id
+
+        # Симуляция для городской застройки
+        cursor.execute(
+            "INSERT INTO Simulation (city_id, mode_id, year) VALUES (%s, %s, %s) RETURNING id;",
+            (city_ids['London'], housing_mode_id, year)
+        )
+        housing_sim_id = cursor.fetchone()[0]
+        simulation_ids['housing'][year] = housing_sim_id
+
+    print(f"Created simulations for London for years from 1500 to 2020 in both modes")
+
+    conn.commit()
+    return city_ids['London'], {'transport': transport_mode_id, 'housing': housing_mode_id}, simulation_ids
+
+
+def parse_osm_and_fill_database(osm_file_path, simulation_ids, conn):
+    """Парсит OSM файл и заполняет базу данных геообъектами"""
+    print(f"Starting OSM file processing: {osm_file_path}")
+
+    # Загружаем данные из файла
+    try:
+        tree = ET.parse(osm_file_path)
+        root = tree.getroot()
+    except Exception as e:
+        print(f"Error reading OSM file: {e}")
+        return
+
+    # Подготовка словаря для хранения узлов (nodes)
+    nodes_dict = {}
+
+    # Первый проход - извлечение всех узлов
+    print("First pass - extracting all nodes...")
+    node_count = 0
+    for element in root:
+        if element.tag == 'node':
+            node_id = element.get('id')
+            lat = float(element.get('lat'))
+            lon = float(element.get('lon'))
+            nodes_dict[node_id] = (lon, lat)
+            node_count += 1
+            if node_count % 10000 == 0:
+                print(f"Processed {node_count} nodes...")
+
+    print(f"Extracted {len(nodes_dict)} nodes from OSM file")
+
+    # Второй проход - обработка и вставка только линий и полигонов
+    print("Second pass - processing ways and relations only...")
+
+    cursor = conn.cursor()
+    processed_count = 0
+    skipped_count = 0
+    transport_count = 0
+    housing_count = 0
+
+    for element in root:
+        # Обрабатываем только линии (way) и отношения (relation), пропускаем узлы (node)
+        if element.tag not in ('way', 'relation'):
+            continue
+
+        # Начинаем новую транзакцию для каждого элемента
+        try:
+            # Извлекаем информацию об объекте
+            element_id = element.get('id')
+            element_type = element.tag
+
+            # Проверяем наличие тегов
+            start_date = None
+            end_date = None
+            name = None
+            role = None
+
+            # Собираем все теги в строку для description
+            all_tags_str = []
+
+            for tag in element.findall('tag'):
+                k = tag.get('k')
+                v = tag.get('v')
+
+                if k == 'start_date':
+                    start_date = v
+                elif k == 'end_date':
+                    end_date = v
+                elif k == 'name':
+                    name = v
+                elif k in ('highway', 'railway', 'amenity', 'building', 'landuse', 'natural', 'waterway'):
+                    role = f"{k}:{v}" if role is None else f"{role}; {k}:{v}"
+                else:
+                    # Добавляем каждый тег в общую строку
+                    all_tags_str.append(f'{k}: {v}')
+
+            # Формируем description из всех тегов
+            description = ",".join(all_tags_str) if all_tags_str else None
+
+            # Если нет тегов с ролью, определяем роль по типу элемента
+            if not role:
+                role = element_type
+
+            # Формируем имя объекта
+            if not name:
+                name = f"{element_type}_{element_id}"
+
+            # Определяем годы существования объекта
+            start_year = get_year(start_date) or 1500  # По умолчанию с начала периода
+            end_year = get_year(end_date) or 2020  # По умолчанию до конца периода
+
+            # Определяем, к какому режиму моделирования относится объект
+            mode_type = determine_mode(role)
+
+            # Если не удалось определить режим, пропускаем объект
+            if not mode_type:
+                skipped_count += 1
+                continue
+
+            # Создаем геометрию на основе типа элемента
+            geom_query = None
+
+            if element_type == 'way':
+                # Для путей собираем все точки
+                node_refs = []
+                for nd in element.findall('nd'):
+                    ref = nd.get('ref')
+                    if ref in nodes_dict:
+                        node_refs.append(nodes_dict[ref])
+
+                if len(node_refs) > 1:
+                    # Проверяем, является ли путь замкнутым (полигоном)
+                    is_polygon = (len(node_refs) > 3 and node_refs[0] == node_refs[-1])
+
+                    points_text = ", ".join([f"ST_MakePoint({lon}, {lat})" for lon, lat in node_refs])
+
+                    if is_polygon:
+                        geom_query = f"ST_SetSRID(ST_MakePolygon(ST_MakeLine(ARRAY[{points_text}])), 4326)"
+                    else:
+                        geom_query = f"ST_SetSRID(ST_MakeLine(ARRAY[{points_text}]), 4326)"
+                else:
+                    # Недостаточно точек для линии или полигона
+                    skipped_count += 1
+                    continue
+
+            elif element_type == 'relation':
+                # Для отношений используем упрощенный подход - пропускаем их
+                skipped_count += 1
+                continue
+
+            if not geom_query:
+                skipped_count += 1
+                continue
+
+            # Начинаем новую транзакцию для каждого объекта
+            with conn.cursor() as object_cursor:
+                # Добавляем объект в таблицу GeoObject
+                object_cursor.execute(
+                    f"INSERT INTO GeoObject (name, role, description, location) VALUES (%s, %s, %s, {geom_query}) RETURNING id;",
+                    (name, role, description)
+                )
+                geo_object_id = object_cursor.fetchone()[0]
+
+                # Добавляем связи в GeoObjectSimulation для каждого года существования объекта
+                for year in range(max(start_year, 1500), min(end_year + 1, 2021)):
+                    if year in simulation_ids[mode_type]:
+                        object_cursor.execute(
+                            "INSERT INTO GeoObjectSimulation (simulation_id, geo_object_id) VALUES (%s, %s);",
+                            (simulation_ids[mode_type][year], geo_object_id)
+                        )
+
+            conn.commit()
+            processed_count += 1
+
+            # Считаем объекты по режимам
+            if mode_type == 'transport':
+                transport_count += 1
+            elif mode_type == 'housing':
+                housing_count += 1
+
+            # Выводим статус
+            if processed_count % 100 == 0:
+                print(
+                    f"Processed {processed_count} objects (Transport: {transport_count}, Housing: {housing_count}), skipped {skipped_count}...")
+
+        except Exception as e:
+            conn.rollback()  # Откатываем неудачную транзакцию
+            print(f"Error processing {element_type}_{element_id}: {e}")
+            skipped_count += 1
+
+    print(
+        f"OSM file processing completed. Added: {processed_count} (Transport: {transport_count}, Housing: {housing_count}), Skipped: {skipped_count}")
+
+
+def main():
+    start_time = time.time()
+
+    try:
+        # Подключение к базе данных
+        conn = psycopg2.connect(**db_params)
+
+        # Создание начальных данных
+        city_id, mode_ids, simulation_ids = setup_initial_data(conn)
+
+        # Обработка OSM файла и наполнение базы данных
+        osm_file_path = "merged_map.osm"
+        parse_osm_and_fill_database(osm_file_path, simulation_ids, conn)
+
+        elapsed_time = time.time() - start_time
+        print(f"Database population completed in {elapsed_time:.2f} seconds!")
+
+    except Exception as e:
+        print(f"An error occurred: {e}")
+    finally:
+        if 'conn' in locals():
+            conn.close()
+
+
+if __name__ == "__main__":
+    main()
