@@ -200,39 +200,49 @@ def setup_initial_data(conn):
     housing_mode_id = cursor.fetchone()[0]
     print(f"Created mode 'Housing Development Modeling' with ID: {housing_mode_id}")
 
-    # Создание словаря для хранения ID симуляций
+    # Создание словаря для хранения ID симуляций по городам
     simulation_ids = {
-        'transport': {},
-        'housing': {}
+        'London': {'transport': {}, 'housing': {}},
+        'Paris': {'transport': {}, 'housing': {}},
+        'Moscow': {'transport': {}, 'housing': {}},
+        'Rome': {'transport': {}, 'housing': {}},
+        'Saint Petersburg': {'transport': {}, 'housing': {}}
     }
 
     # Создание симуляций для каждого города в каждом режиме с 1500 по 2020
     for city_info in cities_info:
+        city_name = city_info['name']
         for year in range(city_info['start_date'], city_info['end_date']):
             # Симуляция для транспортной инфраструктуры
             cursor.execute(
                 "INSERT INTO Simulation (city_id, mode_id, year) VALUES (%s, %s, %s) RETURNING id;",
-                (city_ids[city_info['name']], transport_mode_id, year)
+                (city_ids[city_name], transport_mode_id, year)
             )
             transport_sim_id = cursor.fetchone()[0]
-            simulation_ids['transport'][year] = transport_sim_id
+            simulation_ids[city_name]['transport'][year] = transport_sim_id
+
             # Симуляция для городской застройки
             cursor.execute(
                 "INSERT INTO Simulation (city_id, mode_id, year) VALUES (%s, %s, %s) RETURNING id;",
-                (city_ids[city_info['name']], housing_mode_id, year)
+                (city_ids[city_name], housing_mode_id, year)
             )
             housing_sim_id = cursor.fetchone()[0]
-            simulation_ids['housing'][year] = housing_sim_id
+            simulation_ids[city_name]['housing'][year] = housing_sim_id
 
-        print(f"Created simulations for {city_info['name']} for years from {city_info['start_date']} to {city_info['end_date']} in both modes")
+        print(
+            f"Created simulations for {city_name} for years from {city_info['start_date']} to {city_info['end_date']} in both modes")
 
     conn.commit()
     return city_ids, {'transport': transport_mode_id, 'housing': housing_mode_id}, simulation_ids
 
 
-def parse_osm_and_fill_database(osm_file_path, simulation_ids, conn):
-    """Парсит OSM файл и заполняет базу данных геообъектами"""
+def parse_osm_and_fill_database(osm_file_path, city_ids, simulation_ids, conn):
+    """Парсит OSM файл и заполняет базу данных геообъектами для Лондона"""
     print(f"Starting OSM file processing: {osm_file_path}")
+
+    # Используем ID Лондона для всех геообъектов из файла
+    london_city_id = city_ids['London']
+    print(f"All objects from {osm_file_path} will be linked to London (ID: {london_city_id})")
 
     # Загружаем данные из файла
     try:
@@ -373,11 +383,12 @@ def parse_osm_and_fill_database(osm_file_path, simulation_ids, conn):
                 geo_object_id = object_cursor.fetchone()[0]
 
                 # Добавляем связи в GeoObjectSimulation для каждого года существования объекта
-                for year in range(max(start_year, 1500), min(end_year + 1, 2100)):
-                    if year in simulation_ids[mode_type]:
+                # Используем только симуляции для Лондона
+                for year in range(max(start_year, 1500), min(end_year + 1, 2050)):
+                    if year in simulation_ids['London'][mode_type]:
                         object_cursor.execute(
                             "INSERT INTO GeoObjectSimulation (simulation_id, geo_object_id) VALUES (%s, %s);",
-                            (simulation_ids[mode_type][year], geo_object_id)
+                            (simulation_ids['London'][mode_type][year], geo_object_id)
                         )
 
             conn.commit()
@@ -400,7 +411,7 @@ def parse_osm_and_fill_database(osm_file_path, simulation_ids, conn):
             skipped_count += 1
 
     print(
-        f"OSM file processing completed. Added: {processed_count} (Transport: {transport_count}, Housing: {housing_count}), Skipped: {skipped_count}")
+        f"OSM file processing completed for London. Added: {processed_count} (Transport: {transport_count}, Housing: {housing_count}), Skipped: {skipped_count}")
 
 
 def main():
@@ -411,11 +422,11 @@ def main():
         conn = psycopg2.connect(**db_params)
 
         # Создание начальных данных
-        city_id, mode_ids, simulation_ids = setup_initial_data(conn)
+        city_ids, mode_ids, simulation_ids = setup_initial_data(conn)
 
-        # Обработка OSM файла и наполнение базы данных
+        # Обработка OSM файла и наполнение базы данных (только для Лондона)
         osm_file_path = "merged_map.osm"
-        parse_osm_and_fill_database(osm_file_path, simulation_ids, conn)
+        parse_osm_and_fill_database(osm_file_path, city_ids, simulation_ids, conn)
 
         elapsed_time = time.time() - start_time
         print(f"Database population completed in {elapsed_time:.2f} seconds!")
