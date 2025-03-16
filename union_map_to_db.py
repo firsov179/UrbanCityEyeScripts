@@ -19,7 +19,7 @@ TRANSPORT_OBJECTS = {
 }
 
 HOUSING_OBJECTS = {
-    'building', 'landuse', 'amenity', 'leisure', 'natural', 'shop', 'tourism',
+    'building', 'landuse', 'amenity', 'leisure', 'shop', 'tourism',
     'historic', 'man_made', 'office', 'residential', 'commercial'
 }
 
@@ -30,7 +30,7 @@ TRANSPORT_CATEGORIES = [
 ]
 
 HOUSING_CATEGORIES = [
-    'building:', 'landuse:', 'amenity:', 'natural:', 'leisure:',
+    'building:', 'landuse:', 'amenity:', 'leisure:',
     'shop:', 'tourism:', 'historic:'
 ]
 
@@ -309,7 +309,7 @@ def parse_osm_and_fill_database(osm_file_path, city_ids, simulation_ids, conn):
                     end_date = v
                 elif k == 'name':
                     name = v
-                elif k in ('highway', 'railway', 'amenity', 'building', 'landuse', 'natural', 'waterway'):
+                elif k in ('highway', 'railway', 'amenity', 'building', 'landuse', 'waterway'):
                     role = f"{k}:{v}" if role is None else f"{role}; {k}:{v}"
                 else:
                     # Добавляем каждый тег в общую строку
@@ -320,7 +320,7 @@ def parse_osm_and_fill_database(osm_file_path, city_ids, simulation_ids, conn):
 
             # Если нет тегов с ролью, определяем роль по типу элемента
             if not role:
-                role = element_type
+                continue
 
             # Формируем имя объекта
             if not name:
