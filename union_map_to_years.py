@@ -42,7 +42,7 @@ def filter_by_year(osm_data, year):
 # Основной код
 if __name__ == "__main__":
     # Загружаем данные из файла
-    with open("merged_map.osm", "rb") as f:
+    with open("merged_map_london.osm", "rb") as f:
         osm_data = f.read()
 
     # Создаем карты для каждого 5-го года с 1561 по 2021

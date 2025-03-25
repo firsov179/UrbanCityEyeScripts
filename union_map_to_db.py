@@ -1,6 +1,7 @@
 import xml.etree.ElementTree as ET
 import psycopg2
 import time
+import os
 from collections import defaultdict
 
 # Параметры подключения к PostgreSQL
@@ -65,6 +66,7 @@ cities_info = [
         'description_ru': 'Лондон — столица и крупнейший город Англии и Великобритании. Известен искусством, коммерцией, образованием и финансами.',
         'start_date': 1500,
         'end_date': 2050,
+        'osm_file': 'merged_map_london.osm'
     },
     {
         'name': 'Paris',
@@ -77,6 +79,7 @@ cities_info = [
         'description_ru': 'Париж — столица и самый густонаселённый город Франции. Известен искусством, модой, гастрономией и культурой.',
         'start_date': 1500,
         'end_date': 2050,
+        'osm_file': None # 'merged_map_paris.osm'
     },
     {
         'name': 'Moscow',
@@ -89,6 +92,7 @@ cities_info = [
         'description_ru': 'Москва — столица и крупнейший город России. Известна архитектурой, историческими зданиями, такими как Кремль и Собор Василия Блаженного.',
         'start_date': 1500,
         'end_date': 2050,
+        'osm_file': None  # Нет файла для Москвы
     },
     {
         'name': 'Rome',
@@ -101,6 +105,7 @@ cities_info = [
         'description_ru': 'Рим — столица Италии, известен как "Вечный город". Знаменит древними руинами, такими как Форум и Колизей.',
         'start_date': 1500,
         'end_date': 2050,
+        'osm_file': None  # Нет файла для Рима
     },
     {
         'name': 'Saint Petersburg',
@@ -113,7 +118,21 @@ cities_info = [
         'description_ru': 'Санкт-Петербург — крупный город в России, основанный Петром Великим. Известен имперской историей и архитектурой.',
         'start_date': 1705,
         'end_date': 2050,
+        'osm_file': None  # Нет файла для Санкт-Петербурга
     },
+    {
+        'name': 'Seoul',
+        'name_ru': 'Сеул',
+        'country': 'South Korea',
+        'country_ru': 'Южная Корея',
+        'foundation': 'Founded in 18 BC as Wiryeseong',
+        'foundation_ru': 'Основан в 18 году до н.э. как Виресон',
+        'description': 'Seoul is the capital and largest metropolis of South Korea. It features a combination of modern skyscrapers, high-tech infrastructure, temples, and palaces.',
+        'description_ru': 'Сеул — столица и крупнейший город Южной Кореи. Сочетает в себе современные небоскребы, высокотехнологичную инфраструктуру, храмы и дворцы.',
+        'start_date': 1500,
+        'end_date': 2050,
+        'osm_file': None #'merged_map_seoul.osm'
+    }
 ]
 
 
@@ -180,54 +199,93 @@ def setup_initial_data(conn):
     cursor = conn.cursor()
     city_ids = {}
 
-    for city_info in cities_info:
-        cursor.execute("""
-            INSERT INTO City (name, name_ru, country, country_ru, foundation, foundation_ru, description, description_ru) 
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
-        """, (city_info['name'], city_info['name_ru'], city_info['country'], city_info['country_ru'],
-              city_info['foundation'], city_info['foundation_ru'], city_info['description'], city_info['description_ru']))
+    # Проверяем, нет ли уже городов в базе данных
+    cursor.execute("SELECT id, name FROM City;")
+    existing_cities = {row[1]: row[0] for row in cursor.fetchall()}
 
-        city_id = cursor.fetchone()[0]
-        city_ids[city_info['name']] = city_id
-        print(f"Created city '{city_info['name']}' with ID: {city_id}")
-
-    # Добавление режимов моделирования
-    cursor.execute("INSERT INTO Mode (name) VALUES ('Transport Infrastructure Modeling') RETURNING id;")
-    transport_mode_id = cursor.fetchone()[0]
-    print(f"Created mode 'Transport Infrastructure Modeling' with ID: {transport_mode_id}")
-
-    cursor.execute("INSERT INTO Mode (name) VALUES ('Housing Development Modeling') RETURNING id;")
-    housing_mode_id = cursor.fetchone()[0]
-    print(f"Created mode 'Housing Development Modeling' with ID: {housing_mode_id}")
-
-    # Создание словаря для хранения ID симуляций по городам
-    simulation_ids = {
-        'London': {'transport': {}, 'housing': {}},
-        'Paris': {'transport': {}, 'housing': {}},
-        'Moscow': {'transport': {}, 'housing': {}},
-        'Rome': {'transport': {}, 'housing': {}},
-        'Saint Petersburg': {'transport': {}, 'housing': {}}
-    }
-
-    # Создание симуляций для каждого города в каждом режиме с 1500 по 2020
     for city_info in cities_info:
         city_name = city_info['name']
-        for year in range(city_info['start_date'], city_info['end_date']):
-            # Симуляция для транспортной инфраструктуры
-            cursor.execute(
-                "INSERT INTO Simulation (city_id, mode_id, year) VALUES (%s, %s, %s) RETURNING id;",
-                (city_ids[city_name], transport_mode_id, year)
-            )
-            transport_sim_id = cursor.fetchone()[0]
-            simulation_ids[city_name]['transport'][year] = transport_sim_id
+        if city_name in existing_cities:
+            city_ids[city_name] = existing_cities[city_name]
+            print(f"City '{city_name}' already exists with ID: {city_ids[city_name]}")
+        else:
+            cursor.execute("""
+                INSERT INTO City (name, name_ru, country, country_ru, foundation, foundation_ru, description, description_ru) 
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id;
+            """, (city_info['name'], city_info['name_ru'], city_info['country'], city_info['country_ru'],
+                  city_info['foundation'], city_info['foundation_ru'], city_info['description'],
+                  city_info['description_ru']))
 
-            # Симуляция для городской застройки
-            cursor.execute(
-                "INSERT INTO Simulation (city_id, mode_id, year) VALUES (%s, %s, %s) RETURNING id;",
-                (city_ids[city_name], housing_mode_id, year)
-            )
-            housing_sim_id = cursor.fetchone()[0]
-            simulation_ids[city_name]['housing'][year] = housing_sim_id
+            city_id = cursor.fetchone()[0]
+            city_ids[city_name] = city_id
+            print(f"Created city '{city_name}' with ID: {city_id}")
+
+    # Проверяем, нет ли уже режимов в базе данных
+    cursor.execute("SELECT id, name FROM Mode;")
+    existing_modes = {row[1]: row[0] for row in cursor.fetchall()}
+
+    # Добавление режимов моделирования
+    if 'Transport Infrastructure Modeling' in existing_modes:
+        transport_mode_id = existing_modes['Transport Infrastructure Modeling']
+        print(f"Mode 'Transport Infrastructure Modeling' already exists with ID: {transport_mode_id}")
+    else:
+        cursor.execute("INSERT INTO Mode (name) VALUES ('Transport Infrastructure Modeling') RETURNING id;")
+        transport_mode_id = cursor.fetchone()[0]
+        print(f"Created mode 'Transport Infrastructure Modeling' with ID: {transport_mode_id}")
+
+    if 'Housing Development Modeling' in existing_modes:
+        housing_mode_id = existing_modes['Housing Development Modeling']
+        print(f"Mode 'Housing Development Modeling' already exists with ID: {housing_mode_id}")
+    else:
+        cursor.execute("INSERT INTO Mode (name) VALUES ('Housing Development Modeling') RETURNING id;")
+        housing_mode_id = cursor.fetchone()[0]
+        print(f"Created mode 'Housing Development Modeling' with ID: {housing_mode_id}")
+
+    # Создание словаря для хранения ID симуляций по городам
+    simulation_ids = {}
+    for city_info in cities_info:
+        city_name = city_info['name']
+        simulation_ids[city_name] = {'transport': {}, 'housing': {}}
+
+    # Проверяем, какие симуляции уже существуют
+    cursor.execute("""
+        SELECT s.id, c.name, m.name, s.year 
+        FROM Simulation s 
+        JOIN City c ON s.city_id = c.id 
+        JOIN Mode m ON s.mode_id = m.id;
+    """)
+    existing_simulations = cursor.fetchall()
+
+    for sim_id, city_name, mode_name, year in existing_simulations:
+        if city_name in simulation_ids:
+            if mode_name == 'Transport Infrastructure Modeling':
+                simulation_ids[city_name]['transport'][year] = sim_id
+            elif mode_name == 'Housing Development Modeling':
+                simulation_ids[city_name]['housing'][year] = sim_id
+
+    # Создаем недостающие симуляции для каждого города
+    for city_info in cities_info:
+        city_name = city_info['name']
+        city_id = city_ids[city_name]
+
+        for year in range(city_info['start_date'], city_info['end_date']):
+            # Проверяем, существует ли симуляция для транспортной инфраструктуры
+            if year not in simulation_ids[city_name]['transport']:
+                cursor.execute(
+                    "INSERT INTO Simulation (city_id, mode_id, year) VALUES (%s, %s, %s) RETURNING id;",
+                    (city_id, transport_mode_id, year)
+                )
+                transport_sim_id = cursor.fetchone()[0]
+                simulation_ids[city_name]['transport'][year] = transport_sim_id
+
+            # Проверяем, существует ли симуляция для городской застройки
+            if year not in simulation_ids[city_name]['housing']:
+                cursor.execute(
+                    "INSERT INTO Simulation (city_id, mode_id, year) VALUES (%s, %s, %s) RETURNING id;",
+                    (city_id, housing_mode_id, year)
+                )
+                housing_sim_id = cursor.fetchone()[0]
+                simulation_ids[city_name]['housing'][year] = housing_sim_id
 
         print(
             f"Created simulations for {city_name} for years from {city_info['start_date']} to {city_info['end_date']} in both modes")
@@ -236,13 +294,18 @@ def setup_initial_data(conn):
     return city_ids, {'transport': transport_mode_id, 'housing': housing_mode_id}, simulation_ids
 
 
-def parse_osm_and_fill_database(osm_file_path, city_ids, simulation_ids, conn):
-    """Парсит OSM файл и заполняет базу данных геообъектами для Лондона"""
-    print(f"Starting OSM file processing: {osm_file_path}")
+def parse_osm_and_fill_database(osm_file_path, city_name, city_id, simulation_ids, conn):
+    """
+    Парсит OSM файл и заполняет базу данных геообъектами для указанного города
 
-    # Используем ID Лондона для всех геообъектов из файла
-    london_city_id = city_ids['London']
-    print(f"All objects from {osm_file_path} will be linked to London (ID: {london_city_id})")
+    Args:
+        osm_file_path: Путь к OSM файлу
+        city_name: Название города
+        city_id: ID города в базе данных
+        simulation_ids: Словарь с ID симуляций
+        conn: Соединение с базой данных
+    """
+    print(f"Starting OSM file processing for {city_name}: {osm_file_path}")
 
     # Загружаем данные из файла
     try:
@@ -270,10 +333,22 @@ def parse_osm_and_fill_database(osm_file_path, city_ids, simulation_ids, conn):
 
     print(f"Extracted {len(nodes_dict)} nodes from OSM file")
 
+    # Проверяем, нет ли уже объектов для этого города
+    cursor = conn.cursor()
+    cursor.execute("""
+        SELECT COUNT(*) FROM GeoObjectSimulation gos
+        JOIN Simulation s ON gos.simulation_id = s.id
+        WHERE s.city_id = %s
+    """, (city_id,))
+    existing_objects_count = cursor.fetchone()[0]
+
+    if existing_objects_count > 0:
+        print(f"City {city_name} already has {existing_objects_count} geo objects. Skipping import.")
+        return
+
     # Второй проход - обработка и вставка только линий и полигонов
     print("Second pass - processing ways and relations only...")
 
-    cursor = conn.cursor()
     processed_count = 0
     skipped_count = 0
     transport_count = 0
@@ -309,7 +384,7 @@ def parse_osm_and_fill_database(osm_file_path, city_ids, simulation_ids, conn):
                     end_date = v
                 elif k == 'name':
                     name = v
-                elif k in ('highway', 'railway', 'amenity', 'building', 'landuse', 'waterway'):
+                elif k in ('highway', 'railway', 'amenity', 'building', 'landuse', 'natural', 'waterway'):
                     role = f"{k}:{v}" if role is None else f"{role}; {k}:{v}"
                 else:
                     # Добавляем каждый тег в общую строку
@@ -320,7 +395,7 @@ def parse_osm_and_fill_database(osm_file_path, city_ids, simulation_ids, conn):
 
             # Если нет тегов с ролью, определяем роль по типу элемента
             if not role:
-                continue
+                role = element_type
 
             # Формируем имя объекта
             if not name:
@@ -383,12 +458,11 @@ def parse_osm_and_fill_database(osm_file_path, city_ids, simulation_ids, conn):
                 geo_object_id = object_cursor.fetchone()[0]
 
                 # Добавляем связи в GeoObjectSimulation для каждого года существования объекта
-                # Используем только симуляции для Лондона
                 for year in range(max(start_year, 1500), min(end_year + 1, 2050)):
-                    if year in simulation_ids['London'][mode_type]:
+                    if year in simulation_ids[city_name][mode_type]:
                         object_cursor.execute(
                             "INSERT INTO GeoObjectSimulation (simulation_id, geo_object_id) VALUES (%s, %s);",
-                            (simulation_ids['London'][mode_type][year], geo_object_id)
+                            (simulation_ids[city_name][mode_type][year], geo_object_id)
                         )
 
             conn.commit()
@@ -411,7 +485,7 @@ def parse_osm_and_fill_database(osm_file_path, city_ids, simulation_ids, conn):
             skipped_count += 1
 
     print(
-        f"OSM file processing completed for London. Added: {processed_count} (Transport: {transport_count}, Housing: {housing_count}), Skipped: {skipped_count}")
+        f"OSM file processing completed for {city_name}. Added: {processed_count} (Transport: {transport_count}, Housing: {housing_count}), Skipped: {skipped_count}")
 
 
 def main():
@@ -424,15 +498,31 @@ def main():
         # Создание начальных данных
         city_ids, mode_ids, simulation_ids = setup_initial_data(conn)
 
-        # Обработка OSM файла и наполнение базы данных (только для Лондона)
-        osm_file_path = "merged_map.osm"
-        parse_osm_and_fill_database(osm_file_path, city_ids, simulation_ids, conn)
+        # Обработка OSM файлов для каждого города
+        for city_info in cities_info:
+            city_name = city_info['name']
+            osm_file = city_info.get('osm_file')
+
+            if osm_file and os.path.exists(osm_file):
+                parse_osm_and_fill_database(
+                    osm_file,
+                    city_name,
+                    city_ids[city_name],
+                    simulation_ids,
+                    conn
+                )
+            elif osm_file:
+                print(f"OSM file for {city_name} not found: {osm_file}")
+            else:
+                print(f"No OSM file specified for {city_name}")
 
         elapsed_time = time.time() - start_time
         print(f"Database population completed in {elapsed_time:.2f} seconds!")
 
     except Exception as e:
         print(f"An error occurred: {e}")
+        import traceback
+        print(traceback.format_exc())
     finally:
         if 'conn' in locals():
             conn.close()
