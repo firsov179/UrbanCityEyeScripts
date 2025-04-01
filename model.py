@@ -1,14 +1,16 @@
+
 import os
 import gc
 import math
 import time
+from multiprocessing import freeze_support
+
 import numpy as np
 import tensorflow as tf
 from PIL import Image
 from sklearn.metrics import pairwise_distances
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Flatten, Dense, LSTM, TimeDistributed, Dropout, \
-    BatchNormalization
+from tensorflow.keras.layers import Input, Conv2D, MaxPooling2D, Flatten, Dense, LSTM, TimeDistributed, Dropout, BatchNormalization
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
 import matplotlib.pyplot as plt
@@ -16,12 +18,11 @@ import re
 import argparse
 import multiprocessing as mp
 from tqdm import tqdm
-from google.colab import drive
+
 import cv2
 import concurrent.futures
 from concurrent.futures import ProcessPoolExecutor
 
-drive.mount('/content/drive')
 
 PATCH_SIZE = 25
 SEQUENCE_LENGTH = 5
@@ -30,15 +31,16 @@ MAX_WORKERS = 10
 STRIDE = 15
 SAMPLE_INTERVAL = 5
 
-BASE_DIR = '/content/drive/MyDrive/diplom/London'
-PATCHES_DIR = os.path.join(BASE_DIR, "patches")
-OUTPUT_DIR = os.path.join(BASE_DIR, "output")
-MODELS_DIR = os.path.join(BASE_DIR, "models")
+BASE_DIR = 'C:\HSE\Okit\pythonProject2'
+PATCHES_DIR = 'C:\HSE\Okit\pythonProject2\patches2'
+OUTPUT_DIR = 'C:\HSE\Okit\pythonProject2\output3\\v1'
+MODELS_DIR = 'C:\HSE\Okit\pythonProject2\models2'
 os.makedirs(PATCHES_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
 
 color_to_class = {
+    (255, 255, 255): 0,  # empty
     (128, 128, 192): 1,  # building:train_station
     (112, 112, 176): 2,  # building:train_station; railway:station
     (96, 96, 160): 3,  # building:train_station; railway:yard
@@ -86,7 +88,6 @@ color_to_class = {
 
 class_to_color = {v: k for k, v in color_to_class.items()}
 
-
 def extract_year(filename):
     """Извлекает год из имени файла"""
     match = re.search(r'(\d{4})\.png', filename)
@@ -97,6 +98,9 @@ def extract_year(filename):
 
 def closest_color(rgb, colors):
     """Находит ближайший цвет из предопределенного набора"""
+    if len(rgb) > 3:
+        rgb = rgb[:3]
+
     rgb = np.array(rgb).reshape(1, -1)
     colors = np.array(list(colors)).reshape(-1, 3)
     distances = pairwise_distances(rgb, colors)
@@ -105,8 +109,11 @@ def closest_color(rgb, colors):
 
 
 def convert_image_to_class_map(image):
-    """Преобразует RGB изображение в карту классов"""
-    height, width, _ = image.shape
+    if len(image.shape) == 3 and image.shape[2] > 3:
+        print(f"Обнаружено изображение с {image.shape[2]} каналами, использую только RGB")
+        image = image[:, :, :3]
+
+    height, width = image.shape[:2]
     class_map = np.zeros((height, width), dtype=np.int32)
 
     for i in range(height):
@@ -116,7 +123,6 @@ def convert_image_to_class_map(image):
             class_map[i, j] = color_to_class[closest]
 
     return class_map
-
 
 def process_image_batch(args):
     """Обрабатывает один батч фрагментов изображения"""
@@ -190,25 +196,74 @@ def save_batch(args):
     return saved_positions
 
 
-# Глобальная функция для векторизованного преобразования в карту классов
-def vectorized_convert_to_class_map(patch, colors_array, color_to_class_dict):
-    """Векторизованная версия преобразования в карту классов"""
-    patch_flat = patch.reshape(-1, 3)
-    distances = np.sqrt(np.sum((patch_flat[:, np.newaxis, :] - colors_array[np.newaxis, :, :]) ** 2, axis=2))
-    closest_indices = np.argmin(distances, axis=1)
-    closest_colors = colors_array[closest_indices]
+def create_integrated_model(input_shape, sequence_length, num_classes):
+    """
+    Создает интегрированную модель, включающую CNN, RF-подобный слой и LSTM.
 
-    class_ids = np.zeros(len(patch_flat), dtype=np.int32)
-    for i, color in enumerate(closest_colors):
-        color_tuple = tuple(color)
-        class_ids[i] = color_to_class_dict[color_tuple]
+    Args:
+        input_shape: Форма входных данных для одного фрагмента (высота, ширина, каналы)
+        sequence_length: Длина временной последовательности
+        num_classes: Количество классов
 
-    return class_ids.reshape(patch.shape[0], patch.shape[1])
+    Returns:
+        Модель Keras
+    """
+    # Входной слой для последовательности фрагментов
+    input_sequence = Input(shape=(sequence_length,) + input_shape)
+
+    # CNN для извлечения признаков из каждого фрагмента последовательности
+    cnn_model = tf.keras.Sequential([
+        Conv2D(16, (3, 3), padding='same', activation='relu'),
+        BatchNormalization(),
+        MaxPooling2D(pool_size=(2, 2)),
+        Conv2D(16, (3, 3), padding='same', activation='relu'),
+        BatchNormalization(),
+        MaxPooling2D(pool_size=(2, 2)),
+        Flatten(),
+        Dense(4, activation='relu')
+    ])
+
+    # TimeDistributed обертка применяет CNN к каждому фрагменту последовательности
+    time_distributed_cnn = TimeDistributed(cnn_model)(input_sequence)
+
+    # LSTM для анализа временной последовательности
+    lstm_out = LSTM(64, return_sequences=False)(time_distributed_cnn)
+    lstm_out = Dropout(0.3)(lstm_out)
+
+    change_probability = Dense(1, activation='sigmoid', name='change_probability')(lstm_out)
+
+    # Слой для предсказания класса
+    class_probabilities = Dense(64, activation='relu')(lstm_out)
+    class_probabilities = BatchNormalization()(class_probabilities)
+    class_probabilities = Dense(num_classes, activation='softmax', name='class_probabilities')(class_probabilities)
+
+    # Создаем модель с несколькими выходами
+    model = Model(inputs=input_sequence, outputs=[change_probability, class_probabilities])
+
+    # Компилируем модель с разными функциями потерь
+    model.compile(
+        optimizer=Adam(learning_rate=0.001),
+        loss={
+            'change_probability': 'binary_crossentropy',
+            'class_probabilities': 'categorical_crossentropy'
+        },
+        metrics={
+            'change_probability': 'accuracy',
+            'class_probabilities': 'accuracy'
+        },
+        loss_weights={
+            'change_probability': 0.3,  # Меньший вес для определения изменения
+            'class_probabilities': 0.7  # Больший вес для предсказания класса
+        }
+    )
+
+    return model
+
 
 # Глобальная функция для обработки пакета координат
 def process_chunk(args):
     """Обрабатывает и сразу сохраняет фрагменты"""
-    chunk_coords, img, height, width, patch_size, year_dir, year, colors_array, color_to_class_dict = args
+    chunk_coords, img, height, width, patch_size, year_dir, year = args
 
     saved_positions = []
 
@@ -220,7 +275,7 @@ def process_chunk(args):
         patch = img[y_start:y_start + patch_size, x_start:x_start + patch_size]
 
         # Преобразуем фрагмент в карту классов (векторизовано)
-        class_map = vectorized_convert_to_class_map(patch, colors_array, color_to_class_dict)
+        class_map = vectorized_convert_to_class_map(patch)
 
         # Сразу сохраняем каждый патч (без промежуточного NPZ)
         patch_filename = f"{year}_{y_start}_{x_start}.npy"
@@ -276,6 +331,12 @@ def process_image_to_patches(img_path, output_dir=PATCHES_DIR, patch_size=PATCH_
 
         # Конвертируем из BGR в RGB
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        # Проверяем и обрезаем, если изображение имеет альфа-канал
+        if img.shape[2] > 3:
+            print(f"Обнаружено изображение с {img.shape[2]} каналами, использую только RGB")
+            img = img[:, :, :3]
+
         height, width, _ = img.shape
 
         # Вычисляем количество фрагментов
@@ -290,22 +351,21 @@ def process_image_to_patches(img_path, output_dir=PATCHES_DIR, patch_size=PATCH_
         sampled_coords = all_coords[::SAMPLE_INTERVAL]
         print(f"Выбрано {len(sampled_coords)} из {total_patches} фрагментов для обработки")
 
-        # Преобразуем словарь цветов в более эффективную структуру для поиска
-        colors_array = np.array(list(color_to_class.keys()))
+
 
         # Ограничиваем количество процессов
-        max_workers = min(4, mp.cpu_count())
-        chunk_size = min(100, len(sampled_coords) // max_workers)
+        max_workers = min(40, mp.cpu_count())
+        chunk_size = len(sampled_coords) // max_workers
 
         # Разделяем координаты на примерно равные части
         coords_chunks = [sampled_coords[i:i + chunk_size] for i in range(0, len(sampled_coords), chunk_size)]
 
         # Подготовка аргументов для обработки чанков
-        chunk_args = [(chunk, img, height, width, patch_size, year_dir, year, colors_array, color_to_class) for chunk in coords_chunks]
+        chunk_args = [(chunk, img, height, width, patch_size, year_dir, year) for chunk in coords_chunks]
 
         # Запускаем параллельную обработку
         all_positions = []
-        max_concurrent = min(4, mp.cpu_count())
+        max_concurrent = min(40, mp.cpu_count())
         with ProcessPoolExecutor(max_workers=max_concurrent) as executor:
             for positions in tqdm(executor.map(process_chunk, chunk_args),
                                   total=len(chunk_args),
@@ -401,6 +461,10 @@ def build_training_data(years_processed, all_positions, output_dir=OUTPUT_DIR, s
     print(f"Всего создано {total_sequences} последовательностей для обучения")
     return train_data_dir
 
+def to_one_hot(class_map, num_classes):
+    """Преобразует карту классов в формат one-hot"""
+    # Внимание: классы начинаются с 1, поэтому отнимаем 1
+    return np.eye(num_classes)[class_map - 1]
 
 # Функция для пакетного создания данных генератора
 def prepare_data_batch(batch_data):
@@ -440,7 +504,7 @@ def prepare_data_batch(batch_data):
 class TrainingDataGenerator:
     """Генератор обучающих данных с пакетной обработкой"""
 
-    def __init__(self, train_data_dir, batch_size=BATCH_SIZE, num_classes=43):
+    def __init__(self, train_data_dir, batch_size=BATCH_SIZE, num_classes=44):
         self.train_data_dir = train_data_dir
         self.batch_size = batch_size
         self.num_classes = num_classes
@@ -448,48 +512,135 @@ class TrainingDataGenerator:
         self.seq_dirs = [os.path.join(train_data_dir, d) for d in os.listdir(train_data_dir)
                          if os.path.isdir(os.path.join(train_data_dir, d))]
 
-        self.all_sequences = []
+        total_seqs = 0
         for seq_dir in self.seq_dirs:
             seq_files = [f for f in os.listdir(seq_dir) if f.startswith('seq_') and f.endswith('.npy')]
-            self.all_sequences.extend([(seq_dir, f) for f in seq_files])
+            total_seqs += len(seq_files)
 
-        print(f"Найдено {len(self.all_sequences)} последовательностей для обучения")
+        print(f"Найдено {total_seqs} последовательностей для обучения")
+        self.total_sequences = total_seqs
 
     def __len__(self):
-        return len(self.all_sequences) // self.batch_size
+        return self.total_sequences // self.batch_size
 
     def generate(self):
-        """Генератор батчей для обучения с использованием multiprocessing"""
+        """Генератор с эффективным управлением памятью"""
+        # Создаем индексы последовательностей динамически
+        all_seq_indices = []
+        for dir_idx, seq_dir in enumerate(self.seq_dirs):
+            seq_files = [f for f in os.listdir(seq_dir) if f.startswith('seq_') and f.endswith('.npy')]
+            for file_idx, seq_file in enumerate(seq_files):
+                all_seq_indices.append((dir_idx, file_idx))
+
         while True:
-            np.random.shuffle(self.all_sequences)
+            # Перемешиваем индексы, а не сами файлы
+            np.random.shuffle(all_seq_indices)
 
-            # Обрабатываем данные пакетами для улучшения производительности
-            with ProcessPoolExecutor(max_workers=min(mp.cpu_count(), 4)) as executor:
-                futures = []
+            for i in range(0, len(all_seq_indices), self.batch_size):
+                batch_indices = all_seq_indices[i:i + self.batch_size]
 
-                for i in range(0, len(self.all_sequences), self.batch_size):
-                    batch_sequences = self.all_sequences[i:i + self.batch_size]
+                X_sequences = []
+                y_classes = []
 
-                    # Запускаем процессы для подготовки батча данных
-                    future = executor.submit(prepare_data_batch, (batch_sequences, self.num_classes))
-                    futures.append(future)
+                for dir_idx, file_idx in batch_indices:
+                    try:
+                        seq_dir = self.seq_dirs[dir_idx]
+                        # Получаем имя файла заново
+                        seq_files = [f for f in os.listdir(seq_dir) if f.startswith('seq_') and f.endswith('.npy')]
+                        if file_idx >= len(seq_files):
+                            continue
 
-                # Получаем результаты по мере их готовности
-                for future in futures:
-                    X_np, y_np = future.result()
+                        seq_file = seq_files[file_idx]
+                        seq_idx = seq_file.split('_')[1].split('.')[0]
 
-                    if X_np is not None and y_np is not None:
-                        yield X_np, y_np
+                        seq_path = os.path.join(seq_dir, seq_file)
+                        target_path = os.path.join(seq_dir, f"target_{seq_idx}.npy")
 
-                        # Очистка памяти
-                        del X_np, y_np
-                        gc.collect()
+                        # Загружаем данные с mmap_mode для экономии памяти
+                        sequence = np.load(seq_path, mmap_mode='r')
+                        target_class = np.load(target_path, mmap_mode='r')
+
+                        # Создаем копию только необходимых данных
+                        sequence_copy = sequence.copy()
+                        target_class_copy = target_class.copy()
+
+                        # Закрываем файлы
+                        del sequence, target_class
+
+                        # Преобразуем в one-hot
+                        sequence_one_hot = np.array([to_one_hot(patch, self.num_classes) for patch in sequence_copy])
+
+                        target_one_hot = np.zeros(self.num_classes)
+                        target_one_hot[target_class_copy - 1] = 1
+
+                        X_sequences.append(sequence_one_hot)
+                        y_classes.append(target_one_hot)
+
+                        # Очищаем промежуточные данные
+                        del sequence_copy, target_class_copy, sequence_one_hot
+                    except Exception as e:
+                        print(f"Ошибка при загрузке последовательности {dir_idx}/{file_idx}: {e}")
+                        continue
+
+                if not X_sequences:
+                    continue
+
+                # Создаем массивы и сразу же возвращаем их
+                X_np = np.array(X_sequences, dtype=np.float32)
+                y_np = np.array(y_classes, dtype=np.float32)
+
+                yield X_np, y_np
+
+                # Явно удаляем все ссылки на данные
+                del X_sequences, y_classes, X_np, y_np
+                gc.collect()
+
+def simulate_region_parallel(args):
+    """Параллельно обрабатывает регион изображения при симуляции"""
+    automaton, region, historical_regions, threshold = args
+
+    y_start, y_end, x_start, x_end = region
+    padded_y_start, padded_y_end = y_start - automaton.patch_size // 2, y_end + automaton.patch_size // 2
+    padded_x_start, padded_x_end = x_start - automaton.patch_size // 2, x_end + automaton.patch_size // 2
+
+    # Создаем локальные копии исторических данных
+    local_history = [state[padded_y_start:padded_y_end, padded_x_start:padded_x_end].copy()
+                     for state in historical_regions]
+
+    # Получаем текущее состояние региона
+    current_region = historical_regions[-1][padded_y_start:padded_y_end, padded_x_start:padded_x_end].copy()
+
+    # Создаем новое состояние
+    new_region = current_region.copy()
+
+    # Обрабатываем только центральную часть (без паддинга)
+    for y in range(automaton.patch_size // 2, y_end - y_start + automaton.patch_size // 2):
+        for x in range(automaton.patch_size // 2, x_end - x_start + automaton.patch_size // 2):
+            # Получаем последовательность патчей
+            sequence = []
+            for state in local_history:
+                patch = state[y - automaton.patch_size // 2:y + automaton.patch_size // 2 + 1,
+                        x - automaton.patch_size // 2:x + automaton.patch_size // 2 + 1]
+                sequence.append(patch)
+
+            # Предсказываем изменение
+            change_prob, class_probs = automaton.predict(sequence)
+
+            if change_prob > threshold:
+                new_class = np.argmax(class_probs) + 1
+                new_region[y, x] = new_class
+
+    # Возвращаем только обработанный регион без паддинга
+    result_region = new_region[automaton.patch_size // 2:-automaton.patch_size // 2,
+                    automaton.patch_size // 2:-automaton.patch_size // 2]
+
+    return (y_start, x_start, result_region)
 
 
 class InfrastructureCellularAutomaton:
     """Клеточный автомат для моделирования инфраструктуры"""
 
-    def __init__(self, num_classes=43, patch_size=PATCH_SIZE, sequence_length=SEQUENCE_LENGTH):
+    def __init__(self, num_classes=44, patch_size=PATCH_SIZE, sequence_length=SEQUENCE_LENGTH):
         self.num_classes = num_classes
         self.patch_size = patch_size
         self.sequence_length = sequence_length
@@ -501,16 +652,23 @@ class InfrastructureCellularAutomaton:
         self.model_trained = False
 
     def train(self, train_generator, validation_generator=None, epochs=30):
-        """Обучает модель с использованием генератора данных"""
+        """Обучает модель с использованием генератора данных и контролем использования памяти"""
         print("Начало обучения модели...")
 
         callbacks = [
             EarlyStopping(monitor='val_loss', patience=5, restore_best_weights=True),
-            ModelCheckpoint(os.path.join(MODELS_DIR, 'infrastructure_model.h5'), save_best_only=True)
+            ModelCheckpoint(os.path.join(MODELS_DIR, 'infrastructure_model.h5'), save_best_only=True),
+            ModelCheckpoint(os.path.join(MODELS_DIR, 'infrastructure_model_epoch_{epoch:02d}.h5'), save_freq='epoch'),
+            # Колбэк для очистки памяти каждые 50 батчей
+            tf.keras.callbacks.LambdaCallback(
+                on_batch_end=lambda batch, logs: gc.collect() if batch % 50 == 0 else None
+            )
         ]
 
-        def train_generator_wrapper():
+        # Оптимизированный генератор обучающих данных
+        def optimized_generator():
             for X_batch, y_batch in train_generator.generate():
+                # Создаем метки для изменений
                 change_labels = []
                 for i in range(len(X_batch)):
                     sequence = X_batch[i]
@@ -522,17 +680,31 @@ class InfrastructureCellularAutomaton:
                     changed = 1.0 if last_class != target_class else 0.0
                     change_labels.append(changed)
 
-                yield X_batch, {'change_probability': np.array(change_labels).reshape(-1, 1),
-                                'class_probabilities': y_batch}
+                change_labels = np.array(change_labels, dtype=np.float32).reshape(-1, 1)
 
-        def val_generator_wrapper():
+                # Проверка и исправление формы X_batch
+                if len(X_batch.shape) > 5:
+                    print(f"Исправление формы X_batch: {X_batch.shape}")
+                    X_batch = X_batch.reshape(-1, self.sequence_length, self.patch_size,
+                                              self.patch_size, self.num_classes)
+
+                yield X_batch, {
+                    'change_probability': change_labels,
+                    'class_probabilities': y_batch
+                }
+
+                # Очистка памяти
+                del X_batch, y_batch, change_labels
+                gc.collect()
+
+        # Аналогичный генератор для валидации
+        def validation_generator_wrapper():
             if validation_generator:
                 for X_batch, y_batch in validation_generator.generate():
                     change_labels = []
                     for i in range(len(X_batch)):
                         sequence = X_batch[i]
                         target_class = y_batch[i].argmax() + 1
-
                         last_frame = sequence[-1]
                         center_y, center_x = self.patch_size // 2, self.patch_size // 2
                         last_class = last_frame[center_y, center_x].argmax() + 1
@@ -540,38 +712,38 @@ class InfrastructureCellularAutomaton:
                         changed = 1.0 if last_class != target_class else 0.0
                         change_labels.append(changed)
 
-                    yield X_batch, {'change_probability': np.array(change_labels).reshape(-1, 1),
-                                    'class_probabilities': y_batch}
-            else:
-                yield None, None
+                    change_labels = np.array(change_labels, dtype=np.float32).reshape(-1, 1)
 
-        train_gen = tf.data.Dataset.from_generator(
-            train_generator_wrapper,
-            output_types=(tf.float32, {'change_probability': tf.float32, 'class_probabilities': tf.float32}),
-            output_shapes=(
-                tf.TensorShape([None, self.sequence_length, self.patch_size, self.patch_size, self.num_classes]),
-                {'change_probability': tf.TensorShape([None, 1]),
-                 'class_probabilities': tf.TensorShape([None, self.num_classes])}
-            )
-        ).batch(train_generator.batch_size)
+                    # Проверка и исправление формы X_batch
+                    if len(X_batch.shape) > 5:
+                        X_batch = X_batch.reshape(-1, self.sequence_length, self.patch_size,
+                                                  self.patch_size, self.num_classes)
 
-        val_gen = None
-        if validation_generator:
-            val_gen = tf.data.Dataset.from_generator(
-                val_generator_wrapper,
-                output_types=(tf.float32, {'change_probability': tf.float32, 'class_probabilities': tf.float32}),
-                output_shapes=(
-                    tf.TensorShape([None, self.sequence_length, self.patch_size, self.patch_size, self.num_classes]),
-                    {'change_probability': tf.TensorShape([None, 1]),
-                     'class_probabilities': tf.TensorShape([None, self.num_classes])}
-                )
-            ).batch(validation_generator.batch_size)
+                    yield X_batch, {
+                        'change_probability': change_labels,
+                        'class_probabilities': y_batch
+                    }
 
+                    # Очистка памяти
+                    del X_batch, y_batch, change_labels
+                    gc.collect()
+
+        # Определяем количество шагов для каждой эпохи
+        # Обращаемся правильно к объектам генераторов, а не функциям
+        steps_per_epoch = min(2000, len(train_generator) if hasattr(train_generator, '__len__') else 1000)
+        validation_steps = min(500, len(validation_generator) if validation_generator and hasattr(validation_generator,
+                                                                                                  '__len__') else 250) if validation_generator else None
+
+        print(f"Шагов на эпоху: {steps_per_epoch}, валидационных шагов: {validation_steps}")
+
+        # Обучаем модель без использования tf.data.Dataset
         history = self.model.fit(
-            train_gen,
-            validation_data=val_gen,
+            optimized_generator(),
+            steps_per_epoch=steps_per_epoch,
+            validation_data=validation_generator_wrapper() if validation_generator else None,
+            validation_steps=validation_steps,
             epochs=epochs,
-            callbacks=callbacks
+            callbacks=callbacks,
         )
 
         self.model_trained = True
@@ -592,85 +764,75 @@ class InfrastructureCellularAutomaton:
 
         return change_prob[0][0], class_probs[0]
 
-    def simulate_region_parallel(args):
-        """Параллельно обрабатывает регион изображения при симуляции"""
-        automaton, region, historical_regions, threshold = args
+    def predict_batch(self, sequences):
+        """Предсказывает изменения и классы для батча последовательностей"""
+        if not self.model_trained:
+            raise ValueError("Модель не обучена")
 
-        y_start, y_end, x_start, x_end = region
-        padded_y_start, padded_y_end = y_start - automaton.patch_size // 2, y_end + automaton.patch_size // 2
-        padded_x_start, padded_x_end = x_start - automaton.patch_size // 2, x_end + automaton.patch_size // 2
+        # Преобразуем последовательности в one-hot представление
+        sequences_one_hot = []
+        for sequence in sequences:
+            seq_one_hot = np.array([to_one_hot(patch, self.num_classes) for patch in sequence])
+            sequences_one_hot.append(seq_one_hot)
 
-        # Создаем локальные копии исторических данных
-        local_history = [state[padded_y_start:padded_y_end, padded_x_start:padded_x_end].copy()
-                         for state in historical_regions]
+        X = np.array(sequences_one_hot)
 
-        # Получаем текущее состояние региона
-        current_region = historical_regions[-1][padded_y_start:padded_y_end, padded_x_start:padded_x_end].copy()
+        # Выполняем предсказание для всего батча сразу
+        change_probs, class_probs = self.model.predict(X, batch_size=32, verbose=0)
 
-        # Создаем новое состояние
-        new_region = current_region.copy()
+        return change_probs, class_probs
 
-        # Обрабатываем только центральную часть (без паддинга)
-        for y in range(automaton.patch_size // 2, y_end - y_start + automaton.patch_size // 2):
-            for x in range(automaton.patch_size // 2, x_end - x_start + automaton.patch_size // 2):
-                # Получаем последовательность патчей
+    def simulate_step_parallel(self, historical_states, threshold=0.5, batch_size=256):
+        """Выполняет один шаг симуляции клеточного автомата с пакетной обработкой"""
+        new_state = historical_states[-1].copy()
+        height, width = new_state.shape
+
+        # Создаем список координат всех пикселей
+        all_coords = []
+        for y in range(self.patch_size // 2, height - self.patch_size // 2):
+            for x in range(self.patch_size // 2, width - self.patch_size // 2):
+                all_coords.append((y, x))
+
+        # Разбиваем координаты на батчи
+        num_batches = (len(all_coords) + batch_size - 1) // batch_size
+
+        print(f"Всего координат: {len(all_coords)}, будет обработано {num_batches} батчей")
+
+        # Обрабатываем батчи
+        for batch_idx in tqdm(range(num_batches), desc="Обработка батчей"):
+            start_idx = batch_idx * batch_size
+            end_idx = min((batch_idx + 1) * batch_size, len(all_coords))
+
+            batch_coords = all_coords[start_idx:end_idx]
+            batch_sequences = []
+
+            # Подготавливаем последовательности для текущего батча
+            for y, x in batch_coords:
                 sequence = []
-                for state in local_history:
-                    patch = state[y - automaton.patch_size // 2:y + automaton.patch_size // 2 + 1,
-                            x - automaton.patch_size // 2:x + automaton.patch_size // 2 + 1]
+                for state in historical_states:
+                    patch = state[y - self.patch_size // 2:y + self.patch_size // 2 + 1,
+                            x - self.patch_size // 2:x + self.patch_size // 2 + 1]
                     sequence.append(patch)
+                batch_sequences.append(sequence)
 
-                # Предсказываем изменение
-                change_prob, class_probs = automaton.predict(sequence)
+            # Предсказываем для всего батча сразу
+            try:
+                change_probs, class_probs = self.predict_batch(batch_sequences)
 
-                if change_prob > threshold:
-                    new_class = np.argmax(class_probs) + 1
-                    new_region[y, x] = new_class
-
-        # Возвращаем только обработанный регион без паддинга
-        result_region = new_region[automaton.patch_size // 2:-automaton.patch_size // 2,
-                        automaton.patch_size // 2:-automaton.patch_size // 2]
-
-        return (y_start, x_start, result_region)
-
-    def simulate_step_parallel(automaton, current_state, historical_states, threshold=0.5):
-        """Выполняет один шаг симуляции клеточного автомата с параллельной обработкой"""
-        height, width = current_state.shape
-        new_state = current_state.copy()
-
-        # Разбиваем изображение на регионы для параллельной обработки
-        # Используем перекрытие, чтобы избежать краевых эффектов
-        region_size = 100  # Размер региона, можно настроить
-
-        regions = []
-        for y in range(0, height, region_size):
-            for x in range(0, width, region_size):
-                y_end = min(y + region_size, height)
-                x_end = min(x + region_size, width)
-                regions.append((y, y_end, x, x_end))
-
-        # Подготавливаем аргументы для параллельной обработки
-        process_args = [(automaton, region, historical_states + [current_state], threshold)
-                        for region in regions]
-
-        # Запускаем параллельную обработку
-        with ProcessPoolExecutor(max_workers=mp.cpu_count()) as executor:
-            for y_start, x_start, region_result in tqdm(
-                    executor.map(simulate_region_parallel, process_args),
-                    total=len(regions),
-                    desc="Обработка регионов"
-            ):
-                # Обновляем соответствующую часть нового состояния
-                y_end = min(y_start + region_size, height)
-                x_end = min(x_start + region_size, width)
-                new_state[y_start:y_end, x_start:x_end] = region_result
+                # Обрабатываем результаты предсказания
+                for i, (y, x) in enumerate(batch_coords):
+                    if change_probs[i] > threshold:
+                        new_class = np.argmax(class_probs[i]) + 1
+                        new_state[y, x] = new_class
+            except Exception as e:
+                print(f"Ошибка при предсказании для батча {batch_idx}: {e}")
+                # Пропускаем этот батч и продолжаем
+                continue
 
         return new_state
 
-    def simulate(self, initial_state, historical_states, num_steps, threshold=0.5):
+    def simulate(self, states, num_steps, threshold=0.5, batch_size=256):
         """Выполняет симуляцию на указанное количество шагов"""
-        states = historical_states + [initial_state]
-        current_state = initial_state
 
         for i in range(num_steps):
             print(f"Шаг симуляции {i + 1}/{num_steps}")
@@ -681,11 +843,8 @@ class InfrastructureCellularAutomaton:
                 padding = [history[0]] * (self.sequence_length - len(history))
                 history = padding + history
 
-            history = history[:-1]
+            new_state = self.simulate_step_parallel(history, threshold, batch_size)
 
-            new_state = self.simulate_step_parallel(current_state, history, threshold)
-
-            current_state = new_state
             states.append(new_state)
 
             np.save(os.path.join(OUTPUT_DIR, f"simulation_step_{i}.npy"), new_state)
@@ -794,35 +953,6 @@ def analyze_results(automaton, states, years, output_dir=OUTPUT_DIR):
     plt.close()
 
 
-def preprocess_images(image_paths):
-    """Обрабатывает все изображения, сохраняя фрагменты на диск"""
-    sorted_paths = sorted(image_paths, key=lambda x: extract_year(os.path.basename(x)))
-
-    print(f"Найдено {len(sorted_paths)} изображений карт")
-
-    years_processed = []
-    all_positions = {}
-
-    for img_path in sorted_paths:
-        gc.collect()
-
-        print(f"Обработка изображения: {os.path.basename(img_path)}")
-        year, positions = process_image_to_patches(img_path)
-
-        if year is not None:
-            years_processed.append(year)
-            all_positions[year] = positions
-
-            # Сохраняем промежуточные результаты после каждого изображения
-            np.save(os.path.join(OUTPUT_DIR, "years_processed.npy"), np.array(years_processed))
-            np.save(os.path.join(OUTPUT_DIR, f"positions_{year}.npy"), positions)
-
-            # Даем время на сбор мусора и охлаждение
-            time.sleep(1)
-
-    return years_processed, all_positions
-
-
 def build_training_data(years_processed, all_positions, output_dir=OUTPUT_DIR, seq_length=SEQUENCE_LENGTH):
     """Создает обучающие данные, сохраняя последовательности и целевые значения"""
     print("Создание обучающих данных...")
@@ -876,6 +1006,73 @@ def build_training_data(years_processed, all_positions, output_dir=OUTPUT_DIR, s
 def validate_model(automaton, validation_year, historical_years, image_paths):
     """
     Валидирует модель, сравнивая предсказания с реальными данными.
+    """
+    print(f"Начинаем загрузку изображения для {validation_year} года...")
+    start_start = time.time()
+
+    validation_path = next(path for path in image_paths if extract_year(os.path.basename(path)) == validation_year)
+    validation_img = Image.open(validation_path).convert('RGB')
+    validation_array = np.array(validation_img)
+
+    print(f"Преобразуем цвета в классы...")
+
+    validation_map = vectorized_convert_to_class_map(validation_array)
+
+
+    print(f"Преобразование завершено за {time.time() - start_start:.2f} секунд")
+
+    start_start = time.time()
+    print(f"Преобразуем historical_years...")
+
+    historical_maps = []
+    for year in tqdm(historical_years) :
+        history_path = next(path for path in image_paths if extract_year(os.path.basename(path)) == year)
+        history_img = Image.open(history_path).convert('RGB')
+        history_array = np.array(history_img)
+        history_map = vectorized_convert_to_class_map(history_array)
+        historical_maps.append(history_map)
+
+    print(f"Преобразование завершено за {time.time() - start_start:.2f} секунд")
+    initial_state = historical_maps[-1]
+    historical_states = historical_maps[:-1]
+
+    print(f"Временно используем простую копию последнего состояния вместо предсказания...")
+    # Временно используем простую копию последнего состояния вместо предсказания
+    predicted_map = initial_state.copy()
+
+
+    correct_pixels = np.sum(predicted_map == validation_map)
+    total_pixels = validation_map.size
+    accuracy = correct_pixels / total_pixels
+
+    print(f"Точность предсказания для {validation_year} года: {accuracy:.4f}")
+
+    automaton.visualize_state(validation_map,
+                              output_path=os.path.join(OUTPUT_DIR, f"real_{validation_year}.png"),
+                              title=f"Реальное состояние {validation_year} года")
+
+    automaton.visualize_state(predicted_map,
+                              output_path=os.path.join(OUTPUT_DIR, f"predicted_{validation_year}.png"),
+                              title=f"Предсказанное состояние {validation_year} года")
+
+    diff_map = (predicted_map != validation_map).astype(np.int32)
+    plt.figure(figsize=(12, 12))
+    plt.imshow(diff_map, cmap='Reds')
+    plt.title(f"Разница между предсказанием и реальностью для {validation_year} года")
+    plt.colorbar(label="Ошибка")
+    plt.savefig(os.path.join(OUTPUT_DIR, f"diff_{validation_year}.png"), bbox_inches='tight', dpi=150)
+    plt.close()
+
+    return {
+        'accuracy': accuracy,
+        'correct_pixels': correct_pixels,
+        'total_pixels': total_pixels
+    }
+
+
+'''def validate_model(automaton, validation_year, historical_years, image_paths):
+    """
+    Валидирует модель, сравнивая предсказания с реальными данными.
 
     Args:
         automaton: Обученная модель
@@ -887,12 +1084,13 @@ def validate_model(automaton, validation_year, historical_years, image_paths):
         Метрики качества
     """
     validation_path = next(path for path in image_paths if extract_year(os.path.basename(path)) == validation_year)
-    validation_img = Image.open(validation_path)
+
+    validation_img = Image.open(validation_path).convert('RGB')
     validation_array = np.array(validation_img)
     validation_map = convert_image_to_class_map(validation_array)
 
     historical_maps = []
-    for year in historical_years:
+    for year in tqdm(historical_years):
         history_path = next(path for path in image_paths if extract_year(os.path.basename(path)) == year)
         history_img = Image.open(history_path)
         history_array = np.array(history_img)
@@ -931,10 +1129,53 @@ def validate_model(automaton, validation_year, historical_years, image_paths):
         'correct_pixels': correct_pixels,
         'total_pixels': total_pixels
     }
+'''
+
+
+def vectorized_convert_to_class_map(image):
+    """Векторизованная версия преобразования в карту классов"""
+    print(f"Начинаем векторизованное преобразование изображения размером {image.shape}")
+
+    # Сохраняем оригинальную форму
+    original_shape = image.shape[:2]
+
+    # Преобразуем в одномерный массив RGB-значений
+    pixels = image.reshape(-1, 3)
+    print(f"Преобразовано в массив размером {pixels.shape}")
+
+    # Подготавливаем массив цветов из словаря
+    colors_array = np.array(list(color_to_class.keys()))
+    print(f"Подготовлен массив цветов размером {colors_array.shape}")
+
+    # Обрабатываем по частям, чтобы избежать проблем с памятью
+    batch_size = 100000  # Настройте этот параметр в зависимости от доступной памяти
+    num_batches = (pixels.shape[0] + batch_size - 1) // batch_size
+
+    class_indices = np.zeros(pixels.shape[0], dtype=np.int32)
+
+    print(f"Обработка по батчам: {num_batches} батчей по {batch_size} пикселей")
+    for i in range(num_batches):
+        start_idx = i * batch_size
+        end_idx = min((i + 1) * batch_size, pixels.shape[0])
+
+        current_batch = pixels[start_idx:end_idx]
+
+        print(f"Обработка батча {i + 1}/{num_batches}: {current_batch.shape[0]} пикселей")
+
+        # Вычисляем расстояния для текущего батча
+        distances = np.sqrt(((current_batch[:, np.newaxis, :] - colors_array[np.newaxis, :, :]) ** 2).sum(axis=2))
+        closest_indices = np.argmin(distances, axis=1)
+
+        # Преобразуем индексы цветов в индексы классов
+        for j, color_idx in enumerate(closest_indices):
+            class_indices[start_idx + j] = color_to_class[tuple(colors_array[color_idx])]
+
+    # Возвращаем массив классов в исходной форме изображения
+    return class_indices.reshape(original_shape)
 
 
 def phase1_preprocess_images():
-    """Фаза 1: Предварительная обработка изображений"""
+    """Фаза 1: Предварительная обработка изображений с проверкой уже обработанных"""
     print("Фаза 1: Предварительная обработка изображений...")
 
     all_image_paths = [os.path.join(BASE_DIR, f) for f in os.listdir(BASE_DIR) if f.endswith('.png')]
@@ -942,9 +1183,59 @@ def phase1_preprocess_images():
 
     print(f"Найдено {len(all_image_paths)} изображений карт")
 
-    years_processed, all_positions = preprocess_images(all_image_paths)
+    # Проверяем, какие годы уже обработаны
+    processed_years = []
+    if os.path.exists(os.path.join(OUTPUT_DIR, "years_processed.npy")):
+        processed_years = np.load(os.path.join(OUTPUT_DIR, "years_processed.npy")).tolist()
+    else:
+        # Проверяем файлы positions_*.npy
+        for year in range(1500, 2024):
+            pos_file = os.path.join(OUTPUT_DIR, f"positions_{year}.npy")
+            if os.path.exists(pos_file):
+                processed_years.append(year)
 
-    print(f"Обработка изображений завершена. Обработаны годы: {years_processed}")
+    if processed_years:
+        print(f"Уже обработаны годы: {processed_years}")
+
+    # Фильтруем только необработанные изображения
+    remaining_paths = [path for path in all_image_paths
+                      if extract_year(os.path.basename(path)) not in processed_years]
+
+    print(f"Осталось обработать {len(remaining_paths)} изображений")
+
+    # Если все уже обработано, завершаем функцию
+    if not remaining_paths:
+        print("Все изображения уже обработаны!")
+        return processed_years, {}
+
+    years_processed = []
+    all_positions = {}
+
+    for img_path in remaining_paths:
+        gc.collect()
+
+        year = extract_year(os.path.basename(img_path))
+        print(f"Обработка изображения: {os.path.basename(img_path)} (год {year})")
+        year, positions = process_image_to_patches(img_path)
+
+        if year is not None:
+            years_processed.append(year)
+            all_positions[year] = positions
+
+            # Сохраняем промежуточные результаты
+            np.save(os.path.join(OUTPUT_DIR, f"positions_{year}.npy"), positions)
+
+            # Добавляем новый год к общему списку и сразу сохраняем
+            all_years = sorted(processed_years + [year])
+            np.save(os.path.join(OUTPUT_DIR, "years_processed.npy"), np.array(all_years))
+
+
+    # Финальное сохранение всех годов
+    all_years = sorted(processed_years + years_processed)
+    np.save(os.path.join(OUTPUT_DIR, "years_processed.npy"), np.array(all_years))
+
+    print(f"Обработка изображений завершена. Всего обработано {len(all_years)} лет.")
+    return all_years, all_positions
 
 
 def phase2_build_training_data():
@@ -952,9 +1243,6 @@ def phase2_build_training_data():
     print("Фаза 2: Создание обучающих данных...")
 
     train_data_dir = os.path.join(OUTPUT_DIR, "train_data")
-    if os.path.exists(train_data_dir) and len(os.listdir(train_data_dir)) > 0:
-        print("Обучающие данные уже созданы. Пропускаем фазу 2.")
-        return
 
     if not os.path.exists(os.path.join(OUTPUT_DIR, "years_processed.npy")):
         raise FileNotFoundError("Не найдены результаты предварительной обработки. Сначала выполните фазу 1.")
@@ -1047,7 +1335,7 @@ def phase4_train_model():
         f"Готово к обучению: {len(train_gen.all_sequences)} обучающих и {len(val_gen.all_sequences)} валидационных последовательностей")
 
     automaton = InfrastructureCellularAutomaton()
-    automaton.train(train_gen, val_gen, epochs=30)
+    automaton.train(train_gen, val_gen, epochs=4)
 
     automaton.save(model_path)
 
@@ -1098,40 +1386,32 @@ def phase6_simulate_future():
 
     all_years = [extract_year(os.path.basename(path)) for path in all_image_paths]
 
-    last_year = all_years[-1]
-    last_img_path = next(path for path in all_image_paths if extract_year(os.path.basename(path)) == last_year)
-    last_img = Image.open(last_img_path)
-    last_state = convert_image_to_class_map(np.array(last_img))
+    all_years = [1870, 1875, 1880, 1885, 1890, 1895, 1900]
 
     historical_states = []
-    for year in all_years[-SEQUENCE_LENGTH - 1:-1]:
+    for year in all_years[-SEQUENCE_LENGTH:]:
         hist_path = next(path for path in all_image_paths if extract_year(os.path.basename(path)) == year)
-        hist_img = Image.open(hist_path)
-        hist_state = convert_image_to_class_map(np.array(hist_img))
+        hist_img = Image.open(hist_path).convert('RGB')
+        hist_state = vectorized_convert_to_class_map(np.array(hist_img))
         historical_states.append(hist_state)
 
-    num_future_years = 5
+        automaton.visualize_state(hist_state,
+                                  output_path=os.path.join(OUTPUT_DIR, f"simulation_{year}.png"))
 
-    print(f"Симуляция развития на {num_future_years} лет вперед, начиная с {last_year} года")
 
-    future_states = automaton.simulate(last_state, historical_states, num_future_years)
+    print(f"Симуляция развития на 5 лет вперед, начиная с {all_years[-1] + 5} года")
 
-    simulated_years = []
-    for i in range(len(future_states)):
-        if i < len(historical_states) + 1:
-            year = last_year - len(historical_states) + i
-        else:
-            year = last_year + (i - len(historical_states))
+    future_states = automaton.simulate(historical_states, 1)
 
-        simulated_years.append(year)
+    print(len(future_states))
 
-        automaton.visualize_state(future_states[i],
-                                  output_path=os.path.join(OUTPUT_DIR, f"simulation_{year}.png"),
-                                  title=f"Инфраструктура в {year} году")
-
-    analyze_results(automaton, future_states, simulated_years)
+    automaton.visualize_state(future_states[-1],
+      output_path=os.path.join(OUTPUT_DIR, f"simulation_{all_years[-1] + 5}.png"))
 
     print("Симуляция завершена. Результаты сохранены в директории:", OUTPUT_DIR)
+
+    historical_states.append(future_states[-1])
+    analyze_results(automaton, historical_states, [1875, 1880, 1885, 1890, 1895, 1900])
 
 
 def main(phase=0, start_phase=1, end_phase=6):
@@ -1158,13 +1438,187 @@ def main(phase=0, start_phase=1, end_phase=6):
                 phase1_preprocess_images()
             elif phase == 2:
                 phase2_build_training_data()
-            elif phase == 3:
-                phase3_prepare_train_val_split()
-            elif phase == 4:
-                phase4_train_model()
-            elif phase == 5:
-                phase5_validate_model()
-            elif phase == 6:
-                phase6_simulate_future()
 
-main()
+
+
+def test_model_on_patches(num_patches=5, patch_size=100, sequence_length=SEQUENCE_LENGTH):
+    print(f"Тестирование модели на {num_patches} случайных фрагментах...")
+
+    model_path = os.path.join(MODELS_DIR, 'infrastructure_model.h5')
+    image_paths = [os.path.join(BASE_DIR, f) for f in os.listdir(BASE_DIR) if f.endswith('.png')]
+    # Загружаем модель
+    automaton = InfrastructureCellularAutomaton()
+    automaton.load(model_path)
+
+    # Сортируем изображения по годам
+    sorted_images = sorted(image_paths, key=lambda x: extract_year(os.path.basename(x)))
+
+    # Получаем годы
+    years = [extract_year(os.path.basename(path)) for path in sorted_images]
+    print(f"Доступные годы: {years}")
+
+    # Выбираем последние sequence_length+1 года (для исторической последовательности + 1 для проверки)
+    if len(years) >= sequence_length + 1:
+        test_years = years[-sequence_length - 1:]
+        historical_years = test_years[:-1]
+        target_year = test_years[-1]
+    else:
+        print(f"Предупреждение: недостаточно лет для последовательности ({len(years)} < {sequence_length + 1})")
+        # Используем доступные годы, дублируя первый год если необходимо
+        if len(years) < 2:
+            print("Ошибка: нужно минимум 2 года для тестирования")
+            return
+        historical_years = years[:min(sequence_length, len(years) - 1)]
+        if len(historical_years) < sequence_length:
+            # Дублируем первый год для заполнения последовательности
+            historical_years = [historical_years[0]] * (sequence_length - len(historical_years)) + historical_years
+        target_year = years[-1]
+
+    print(f"Используем годы {historical_years} для предсказания {target_year}")
+
+    # Загружаем изображение последнего исторического года для выбора фрагментов
+    last_historical_year = historical_years[-1]
+    last_historical_path = next(
+        path for path in sorted_images if extract_year(os.path.basename(path)) == last_historical_year)
+    last_img = np.array(Image.open(last_historical_path).convert('RGB'))
+
+    # Размеры изображения
+    height, width = last_img.shape[:2]
+
+    # Создаем директорию для сохранения результатов
+    test_dir = os.path.join(OUTPUT_DIR, "model_test_patches")
+    os.makedirs(test_dir, exist_ok=True)
+
+    # Выбираем случайные фрагменты
+    np.random.seed(42)  # Для воспроизводимости
+    patches_info = []
+
+    for i in range(num_patches):
+        # Выбираем случайную позицию (с отступами от краев)
+        margin = patch_size + automaton.patch_size
+        y = np.random.randint(margin, height - margin)
+        x = np.random.randint(margin, width - margin)
+
+        patches_info.append((y, x, patch_size))
+
+    # Создаем словарь для быстрого доступа к изображениям по годам
+    images_by_year = {}
+    for year in historical_years + [target_year]:
+        img_path = next(path for path in sorted_images if extract_year(os.path.basename(path)) == year)
+        img = np.array(Image.open(img_path).convert('RGB'))
+        # Преобразуем изображение в карту классов для всего года
+        print(f"Преобразуем изображение {year} года в карту классов...")
+        class_map = vectorized_convert_to_class_map(img)
+        images_by_year[year] = class_map
+
+    # Обрабатываем каждый фрагмент
+    for idx, (y, x, size) in enumerate(patches_info):
+        print(f"Обработка фрагмента {idx + 1}/{num_patches}...")
+
+        # Создаем директорию для этого фрагмента
+        patch_dir = os.path.join(test_dir, f"patch_{idx + 1}")
+        os.makedirs(patch_dir, exist_ok=True)
+
+        # Вырезаем фрагменты из всех исторических лет
+        historical_patches = []
+        for year in historical_years:
+            # Вырезаем увеличенный фрагмент (с запасом для обработки краев)
+            historical_patches.append(
+                images_by_year[year][y - automaton.patch_size // 2:y + size + automaton.patch_size // 2,
+                x - automaton.patch_size // 2:x + size + automaton.patch_size // 2]
+            )
+
+        # Вырезаем фрагмент целевого года (для сравнения)
+        target_patch = images_by_year[target_year][y:y + size, x:x + size]
+
+        # Сохраняем исторические и целевой фрагменты
+        for i, (year, patch) in enumerate(zip(historical_years, historical_patches)):
+            # Обрезаем патчи до нужного размера для визуализации
+            display_patch = patch[automaton.patch_size // 2:automaton.patch_size // 2 + size,
+                            automaton.patch_size // 2:automaton.patch_size // 2 + size]
+            automaton.visualize_state(
+                display_patch,
+                output_path=os.path.join(patch_dir, f"historical_{year}.png"),
+                title=f"Год {year}"
+            )
+
+        # Сохраняем целевой фрагмент
+        automaton.visualize_state(
+            target_patch,
+            output_path=os.path.join(patch_dir, f"target_{target_year}.png"),
+            title=f"Целевой год {target_year}"
+        )
+
+        # Создаем копию последнего исторического фрагмента для предсказания
+        prediction_patch = historical_patches[-1].copy()
+        center_patch = prediction_patch[automaton.patch_size // 2:automaton.patch_size // 2 + size,
+                       automaton.patch_size // 2:automaton.patch_size // 2 + size]
+
+        # Счетчик изменений
+        changes_count = 0
+
+        # Предсказываем изменения для каждого пикселя в центральной части фрагмента
+        for py in range(automaton.patch_size // 2, size + automaton.patch_size // 2):
+            for px in range(automaton.patch_size // 2, size + automaton.patch_size // 2):
+                # Создаем последовательность патчей для этого пикселя
+                sequence = []
+                for historical_patch in historical_patches:
+                    pixel_patch = historical_patch[
+                                  py - automaton.patch_size // 2:py + automaton.patch_size // 2 + 1,
+                                  px - automaton.patch_size // 2:px + automaton.patch_size // 2 + 1
+                                  ]
+                    sequence.append(pixel_patch)
+
+                # Предсказываем изменение для этого пикселя
+                try:
+                    change_prob, class_probs = automaton.predict(sequence)
+
+                    # Используем более низкий порог для увеличения числа изменений
+                    threshold = 0.3
+
+                    if change_prob > threshold:
+                        new_class = np.argmax(class_probs) + 1
+                        old_class = prediction_patch[py, px]
+                        prediction_patch[py, px] = new_class
+                        changes_count += 1
+                except Exception as e:
+                    print(f"Ошибка при предсказании для пикселя ({py}, {px}): {e}")
+                    continue
+
+        # Обрезаем предсказанный патч до нужного размера
+        predicted_center = prediction_patch[automaton.patch_size // 2:automaton.patch_size // 2 + size,
+                           automaton.patch_size // 2:automaton.patch_size // 2 + size]
+
+        # Сохраняем предсказанный фрагмент
+        automaton.visualize_state(
+            predicted_center,
+            output_path=os.path.join(patch_dir, f"predicted_{target_year}.png"),
+            title=f"Предсказание на {target_year} год (изменено {changes_count} пикселей)"
+        )
+
+        # Создаем и сохраняем карту различий
+        diff_map = (predicted_center != target_patch).astype(np.int32)
+        plt.figure(figsize=(10, 10))
+        plt.imshow(diff_map, cmap='Reds')
+        plt.title(f"Различия между предсказанием и реальностью для {target_year} года")
+        plt.colorbar(label="Ошибка")
+        plt.savefig(os.path.join(patch_dir, f"diff_{target_year}.png"), bbox_inches='tight', dpi=150)
+        plt.close()
+
+        print(
+            f"Фрагмент {idx + 1}: Изменено {changes_count} пикселей из {size * size} ({changes_count / (size * size) * 100:.2f}%)")
+
+        # Создаем и сохраняем карту изменений от последнего исторического года
+        change_map = (predicted_center != center_patch).astype(np.int32)
+        plt.figure(figsize=(10, 10))
+        plt.imshow(change_map, cmap='hot')
+        plt.title(f"Изменения от {historical_years[-1]} к предсказанию {target_year}")
+        plt.colorbar(label="Изменение")
+        plt.savefig(os.path.join(patch_dir, f"changes_to_prediction.png"), bbox_inches='tight', dpi=150)
+        plt.close()
+
+        # Для сравнения, кар
+
+if __name__ == '__main__':
+    freeze_support()
+    test_model_on_patches()

@@ -50,8 +50,10 @@ def merge_osm_data(osm_data_list):
 # Основной код
 if __name__ == "__main__":
     # Исходный bbox
-    bbox = (-0.2067, 51.4642, 0.0546, 51.5579)
 
+    bbox = (-0.22, 51.35, 0.1, 51.65) # london
+    #bbox = ( 126.8433, 37.4580, 127.2004, 37.6523) # seoul
+    #bbox = (2.1746, 48.7671, 2.49463, 48.98934)
     # Разбиваем bbox на 9 частей
     smaller_bboxes = split_bbox(bbox)
 
@@ -69,7 +71,7 @@ if __name__ == "__main__":
     merged_osm = merge_osm_data(osm_data_list)
 
     # Сохраняем результат в файл
-    with open("merged_map.osm", "wb") as f:
+    with open("merged_map_london.osm", "wb") as f:
         f.write(merged_osm)
 
     print("Данные успешно объединены и сохранены в merged_map.osm")
