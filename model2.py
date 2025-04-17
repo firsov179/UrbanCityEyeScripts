@@ -8,6 +8,7 @@ import time
 from multiprocessing import freeze_support
 
 import numpy as np
+from scipy.spatial import KDTree
 import tensorflow as tf
 from PIL import Image
 from sklearn.metrics import pairwise_distances
@@ -24,19 +25,18 @@ from tqdm import tqdm
 
 import cv2
 import concurrent.futures
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 PATCH_SIZE = 25
 SEQUENCE_LENGTH = 5
 BATCH_SIZE = 32
 MAX_WORKERS = 10
-STRIDE = 15
 SAMPLE_INTERVAL = 5
 
-BASE_DIR = 'C:\HSE\Okit\pythonProject2'
-PATCHES_DIR = 'C:\HSE\Okit\pythonProject2\patches2'
-OUTPUT_DIR = 'C:\HSE\Okit\pythonProject2\output3\\v2'
-MODELS_DIR = 'C:\HSE\Okit\pythonProject2\models2'
+BASE_DIR = 'C:\HSE\Okit\diplom3'
+PATCHES_DIR = 'C:\HSE\Okit\diplom3\patches'
+OUTPUT_DIR = 'C:\HSE\Okit\diplom3\output'
+MODELS_DIR = 'C:\HSE\Okit\diplom3\models'
 os.makedirs(PATCHES_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(MODELS_DIR, exist_ok=True)
@@ -90,7 +90,6 @@ color_to_class = {
 
 class_to_color = {v: k for k, v in color_to_class.items()}
 
-
 def extract_year(filename):
     """Извлекает год из имени файла"""
     match = re.search(r'(\d{4})\.png', filename)
@@ -99,16 +98,25 @@ def extract_year(filename):
     return None
 
 
-def closest_color(rgb, colors):
-    """Находит ближайший цвет из предопределенного набора"""
-    if len(rgb) > 3:
-        rgb = rgb[:3]
+def create_kdtree():
+    color_array = np.array(list(color_to_class.keys()))
+    return KDTree(color_array), color_array
 
-    rgb = np.array(rgb).reshape(1, -1)
-    colors = np.array(list(colors)).reshape(-1, 3)
-    distances = pairwise_distances(rgb, colors)
-    index_of_nearest = distances.argmin()
-    return tuple(colors[index_of_nearest])
+
+kdtree, color_list = create_kdtree()
+
+
+def closest_colors_batch(rgb_batch):
+    distances, indices_of_nearest = kdtree.query(rgb_batch)
+    return indices_of_nearest
+
+
+def convert_partial(image_slice):
+    h, w, _ = image_slice.shape
+    image_slice_flat = image_slice.reshape((-1, 3))
+    indices = closest_colors_batch(image_slice_flat)
+    class_map_slice = np.array([color_to_class[tuple(color_list[index])] for index in indices])
+    return class_map_slice.reshape((h, w))
 
 
 def convert_image_to_class_map(image):
@@ -119,113 +127,171 @@ def convert_image_to_class_map(image):
     height, width = image.shape[:2]
     class_map = np.zeros((height, width), dtype=np.int32)
 
-    for i in range(height):
-        for j in range(width):
-            pixel_rgb = tuple(image[i, j])
-            closest = closest_color(pixel_rgb, color_to_class)
-            class_map[i, j] = color_to_class[closest]
+    # Разделяем изображение по горизонтали
+    slice_height = height // 8
+    slices = [(image[start_row:start_row + slice_height], start_row) for start_row in range(0, height, slice_height)]
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(convert_partial, image_slice): start_row for image_slice, start_row in slices}
+        for future in as_completed(futures):
+            class_map_slice = future.result()
+            start_row = futures[future]
+            class_map[start_row:start_row + class_map_slice.shape[0], :] = class_map_slice
 
     return class_map
 
+def convert_class_map_to_image(class_map):
+    # Получаем размер изображения из карты классов
+    height, width = class_map.shape
 
-# Глобальная функция для обработки пакета координат
+    # Создаём пустое изображение с тремя каналами (RGB)
+    image = np.zeros((height, width, 3), dtype=np.uint8)
+
+    # Векторизованное преобразование
+    for class_value, color in class_to_color.items():
+        image[class_map == class_value] = color
+
+    return image
+
 def process_chunk(args):
-    """Обрабатывает и сразу сохраняет фрагменты"""
-    chunk_coords, img, height, width, patch_size, year_dir, year = args
+    """Обрабатывает последовательности карт и сохраняет их в единый файл для каждой группы"""
+    chunk_coords, imgs, height, width, patch_size, years = args
 
     saved_positions = []
-
-    for y_start, x_start in chunk_coords:
-        if y_start + patch_size > height or x_start + patch_size > width:
+    
+    sequences_dir = os.path.join(OUTPUT_DIR, "sequences")
+    os.makedirs(sequences_dir, exist_ok=True)
+    
+    chunk_sequences = []
+    chunk_targets = []
+    chunk_metadata = []
+    chunk_changed = []  # Добавим для отслеживания
+    
+    for center_y, center_x in chunk_coords:
+        # Вычисляем верхний левый угол патча, чтобы (center_y, center_x) был центром
+        y_start = center_y - patch_size // 2
+        x_start = center_x - patch_size // 2
+        
+        # Проверяем, что патч в пределах изображения
+        valid_sequence = True
+        if (y_start < 0 or y_start + patch_size > height or 
+            x_start < 0 or x_start + patch_size > width):
+            valid_sequence = False
+        
+        for img in imgs:
+            if not valid_sequence or (y_start + patch_size > img.shape[0] or 
+                x_start + patch_size > img.shape[1]):
+                valid_sequence = False
+                break
+        
+        if not valid_sequence:
             continue
-
-        # Извлекаем фрагмент
-        patch = img[y_start:y_start + patch_size, x_start:x_start + patch_size]
-
-        # Преобразуем фрагмент в карту классов (векторизовано)
-        class_map = vectorized_convert_to_class_map(patch)
-
-        # Сразу сохраняем каждый патч (без промежуточного NPZ)
-        patch_filename = f"{year}_{y_start}_{x_start}.npy"
-        patch_path = os.path.join(year_dir, patch_filename)
-        np.save(patch_path, class_map)
-
-        saved_positions.append((y_start, x_start))
+            
+        sequence = []
+        for i in range(len(years) - 1):  # Все кроме последней карты
+            year = years[i]
+            patch = imgs[i][y_start:y_start + patch_size, x_start:x_start + patch_size]
+            sequence.append(patch)
+        
+        # Центр патча должен быть исходной координатой
+        target_value = imgs[-1][center_y, center_x]
+        initial_value = imgs[0][center_y, center_x]
+        
+        # Определяем, изменился ли пиксель
+        changed = (initial_value != target_value)
+        chunk_changed.append(changed)
+        
+        chunk_sequences.append(np.array(sequence))
+        chunk_targets.append(target_value)
+        chunk_metadata.append({
+            'y': center_y,
+            'x': center_x,
+            'years': years[:-1],
+            'target_year':  years[-1],
+            'changed': changed  # Добавляем флаг изменения в метаданные
+        })
+        
+        saved_positions.append((center_y, center_x))
+    
+    # Вывод статистики для контроля
+    if chunk_changed:
+        changed_percentage = sum(chunk_changed) / len(chunk_changed) * 100
+        print(f"Процент измененных пикселей в чанке: {changed_percentage:.2f}%")
+    
+    if chunk_sequences:
+        chunk_id = hash(tuple(sorted([(p[0], p[1]) for p in saved_positions]))) % 10000
+        chunk_filename = f"sequence_chunk_{chunk_id}.npz"
+        np.savez_compressed(
+            os.path.join(sequences_dir, chunk_filename),
+            sequences=np.array(chunk_sequences),
+            targets=np.array(chunk_targets),
+            metadata=np.array(chunk_metadata, dtype=object),
+            changed=np.array(chunk_changed)  # Сохраняем для анализа
+        )
+        print(f"Сохранен чанк {chunk_id} с {len(chunk_sequences)} последовательностями")
 
     return saved_positions
 
 
-def process_image_to_patches(img_path, output_dir=PATCHES_DIR, patch_size=PATCH_SIZE, stride=STRIDE):
-    """Оптимизированная версия функции обработки изображения"""
-    # Извлекаем год из имени файла
-    year = extract_year(os.path.basename(img_path))
-    if year is None:
-        print(f"Не удалось извлечь год из: {img_path}")
-        return None, []
+def process_maps_to_data(maps_paths, years, output_dir=PATCHES_DIR, patch_size=PATCH_SIZE):
 
-    # Создаем директорию для фрагментов этого года
-    year_dir = os.path.join(output_dir, str(year))
-    os.makedirs(year_dir, exist_ok=True)
+    data_dir = os.path.join(output_dir, "data")
+    os.makedirs(data_dir, exist_ok=True)
 
-    try:
-        # Загружаем изображение один раз в основном процессе
-        img = cv2.imread(img_path)
-        if img is None:
-            raise ValueError(f"Не удалось загрузить изображение: {img_path}")
+    # Загружаем изображение один раз в основном процессе
+    imgs = [np.load(maps_path) for maps_path in maps_paths]
 
-        # Конвертируем из BGR в RGB
-        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+    print(f"Все изображения с {years[0]} года по {years[-1]}, успешно загружены")
 
-        # Проверяем и обрезаем, если изображение имеет альфа-канал
-        if img.shape[2] > 3:
-            print(f"Обнаружено изображение с {img.shape[2]} каналами, использую только RGB")
-            img = img[:, :, :3]
 
-        height, width, _ = img.shape
+    height, width = imgs[0].shape
 
-        # Вычисляем количество фрагментов
-        n_h = (height - patch_size) // stride + 1
-        n_w = (width - patch_size) // stride + 1
-        total_patches = n_h * n_w
+    print(f"Обработка изображения {years[0]} года, размер: {width}x{height}")
 
-        print(f"Обработка изображения {year} года, размер: {width}x{height}, фрагментов: {total_patches}")
+    first_image = imgs[0]
+    last_image = imgs[-1]
 
-        # Выборка координат с большим шагом (увеличиваем SAMPLE_INTERVAL)
-        all_coords = [(i * stride, j * stride) for i in range(n_h) for j in range(n_w)]
-        sampled_coords = all_coords[::SAMPLE_INTERVAL]
-        print(f"Выбрано {len(sampled_coords)} из {total_patches} фрагментов для обработки")
+    diff = (first_image != last_image).astype(int)
 
-        # Ограничиваем количество процессов
-        max_workers = min(40, mp.cpu_count())
-        chunk_size = len(sampled_coords) // max_workers
+    not_equal_positions = np.where(diff != 0)
+    not_equal_coords = list(zip(not_equal_positions[0], not_equal_positions[1]))
+    num_to_select = len(not_equal_coords)
 
-        # Разделяем координаты на примерно равные части
-        coords_chunks = [sampled_coords[i:i + chunk_size] for i in range(0, len(sampled_coords), chunk_size)]
+    print(f"Выбрано {num_to_select} изменившихся клеток")
 
-        # Подготовка аргументов для обработки чанков
-        chunk_args = [(chunk, img, height, width, patch_size, year_dir, year) for chunk in coords_chunks]
+    equal_positions = np.where(diff == 0)
 
-        # Запускаем параллельную обработку
-        all_positions = []
-        max_concurrent = min(40, mp.cpu_count())
-        with ProcessPoolExecutor(max_workers=max_concurrent) as executor:
-            for positions in tqdm(executor.map(process_chunk, chunk_args),
-                                  total=len(chunk_args),
-                                  desc=f"Обработка {year} года"):
-                all_positions.extend(positions)
+    selected_indices = np.random.choice(len(equal_positions[0]), size=num_to_select, replace=False)
+    selected_equal_coords = list(
+        zip(equal_positions[0][selected_indices], equal_positions[1][selected_indices]))
 
-        # Сохраняем позиции фрагментов
-        positions_file = os.path.join(year_dir, "positions.npy")
-        np.save(positions_file, np.array(all_positions))
 
-        print(f"Сохранено {len(all_positions)} фрагментов для {year} года")
-        return year, all_positions
+    final_coords = not_equal_coords + selected_equal_coords
 
-    except Exception as e:
-        print(f"Ошибка при обработке {img_path}: {e}")
-        import traceback
-        traceback.print_exc()
-        return None, []
+    print(f"Выбрано {len(final_coords)} из {height * width} фрагментов для обработки")
+
+    max_workers = min(40, mp.cpu_count())
+    chunk_size = len(final_coords) // max_workers
+
+    coords_chunks = [final_coords[i:i + chunk_size] for i in range(0, len(final_coords), chunk_size)]
+
+    chunk_args = [(chunk, imgs, height, width, patch_size, years) for chunk in coords_chunks]
+
+    # Запускаем параллельную обработку
+    all_positions = []
+    max_concurrent = min(40, mp.cpu_count())
+    with ThreadPoolExecutor(max_workers=max_concurrent) as executor:
+        for positions in tqdm(executor.map(process_chunk, chunk_args),
+                              total=len(chunk_args),
+                              desc=f"Обработка {years[0]} - {years[-1]} годов"):
+            all_positions.extend(positions)
+
+    # Сохраняем позиции фрагментов
+    positions_file = os.path.join(os.path.join(data_dir, f"positdaions.npy"))
+    np.save(positions_file, np.array(all_positions))
+
+    print(f"Сохранено {len(all_positions)} фрагментов для {years[0]} года")
+    return years[0], all_positions
 
 
 # Функция для создания обучающих данных с пакетной обработкой
@@ -405,30 +471,31 @@ def vectorized_convert_to_class_map(image):
     return class_indices.reshape(original_shape)
 
 
-def phase1_preprocess_images():
-    """Фаза 1: Предварительная обработка изображений с проверкой уже обработанных"""
-    print("Фаза 1: Предварительная обработка изображений...")
+def phase0_imeges_to_maps():
+    """Фаза 0: Предварительная обработка изображений в матрицы"""
+    print("Фаза 0: Предварительная обработка изображений в матрицы...")
 
-    all_image_paths = [os.path.join(BASE_DIR, f) for f in os.listdir(BASE_DIR) if f.endswith('.png')]
+    os.makedirs(os.path.join(OUTPUT_DIR, f"maps/"), exist_ok=True)
+
+    all_image_paths = [os.path.join(OUT, f) for f in os.listdir(BASE_DIR) if f.endswith('.png')]
     all_image_paths.sort(key=lambda x: extract_year(os.path.basename(x)))
 
     print(f"Найдено {len(all_image_paths)} изображений карт")
 
     # Проверяем, какие годы уже обработаны
     processed_years = []
-    if os.path.exists(os.path.join(OUTPUT_DIR, "years_processed.npy")):
-        processed_years = np.load(os.path.join(OUTPUT_DIR, "years_processed.npy"), allow_pickle=True).tolist()
+    if os.path.exists(os.path.join(OUTPUT_DIR, "years_processed_img.npy")):
+        processed_years = np.load(os.path.join(OUTPUT_DIR, "years_processed_img.npy"), allow_pickle=True).tolist()
     else:
         # Проверяем файлы positions_*.npy
-        for year in range(1500, 2024):
-            pos_file = os.path.join(OUTPUT_DIR, f"positions_{year}.npy")
+        for year in range(1680, 1950):
+            pos_file = os.path.join(OUTPUT_DIR, f"maps/{year}.npy")
             if os.path.exists(pos_file):
                 processed_years.append(year)
 
     if processed_years:
         print(f"Уже обработаны годы: {processed_years}")
 
-    # Фильтруем только необработанные изображения
     remaining_paths = [path for path in all_image_paths
                        if extract_year(os.path.basename(path)) not in processed_years]
 
@@ -439,254 +506,286 @@ def phase1_preprocess_images():
         print("Все изображения уже обработаны!")
         return processed_years, {}
 
-    years_processed = []
-    all_positions = {}
+    for remaining_path in remaining_paths:
+        gc.collect()
+        year = extract_year(os.path.basename(remaining_path))
 
-    for img_path in remaining_paths:
+        print(f"Обработка изображений: для года {year}")
+
+        img = cv2.imread(remaining_path)
+        if img is None:
+            raise ValueError(f"Не удалось загрузить изображение: {remaining_path}")
+
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+        if img.shape[2] > 3:
+            img = img[:, :, :3]
+
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img = convert_image_to_class_map(img)
+        print(f"Обработка изображений: для года {year} завершена")
+
+        save_path = os.path.join(OUTPUT_DIR, f"maps/{year}.npy")
+        np.save(save_path, img)
+        print(f"Результат сохранен в файл: {save_path}")
+
+        processed_years.append(year)
+        np.save(os.path.join(OUTPUT_DIR, "years_processed_img.npy"), np.array(processed_years))
+
+    print(f"Обработка изображений завершена. Всего обработано {len(processed_years)} лет.")
+
+
+
+def phase1_preprocess_images():
+    """Фаза 1: Предварительная обработка изображений с проверкой уже обработанных"""
+    print("Фаза 1: Предварительная обработка изображений...")
+
+    os.makedirs(os.path.join(OUTPUT_DIR, f"data/"), exist_ok=True)
+
+    processed_maps = []
+    if os.path.exists(os.path.join(OUTPUT_DIR, "years_processed_img.npy")):
+        processed_maps = np.load(os.path.join(OUTPUT_DIR, "years_processed_img.npy"), allow_pickle=True).tolist()
+    if  processed_maps == []:
+        print("Не найдены результаты фазы 0.")
+        return
+
+    processed_years = []
+    if os.path.exists(os.path.join(OUTPUT_DIR, "years_processed.npy")):
+        processed_years = np.load(os.path.join(OUTPUT_DIR, "years_processed.npy"), allow_pickle=True).tolist()
+    else:
+        for year in range(1680, 1950):
+            pos_file = os.path.join(OUTPUT_DIR, f"data/{year}.npy")
+            if os.path.exists(pos_file):
+                processed_years.append(year)
+
+    all_maps_paths = [os.path.join(OUTPUT_DIR, 'maps/', f) for f in os.listdir(os.path.join(OUTPUT_DIR, 'maps/')) if f.endswith('.npy')]
+
+    if processed_years:
+        print(f"Уже обработаны годы: {processed_years}")
+
+    remaining_paths = [path for path in all_maps_paths
+                       if extract_year(os.path.basename(path)) not in processed_years]
+
+    print(f"Осталось обработать {len(remaining_paths)} изображений")
+
+    if not remaining_paths:
+        print("Все матрицы уже обработаны!")
+        return processed_years, {}
+
+    for i in range(len(remaining_paths) - SEQUENCE_LENGTH):
         gc.collect()
 
-        year = extract_year(os.path.basename(img_path))
-        print(f"Обработка изображения: {os.path.basename(img_path)} (год {year})")
-        year, positions = process_image_to_patches(img_path)
+        maps_paths = remaining_paths[i:i + SEQUENCE_LENGTH + 1]
+        years = [extract_year(os.path.basename(path)) for path in maps_paths]
 
-        if year is not None:
-            years_processed.append(year)
-            all_positions[year] = positions
+        print(f"Обработка изображений: для годов {years[0]} целевой {years[-1]})")
+        process_maps_to_data(maps_paths, years)
 
-            # Сохраняем промежуточные результаты
-            np.save(os.path.join(OUTPUT_DIR, f"positions_{year}.npy"), positions)
+        processed_years.append(years[0])
+        np.save(os.path.join(OUTPUT_DIR, "years_processed.npy"), np.array(processed_years))
 
-            # Добавляем новый год к общему списку и сразу сохраняем
-            all_years = sorted(processed_years + [year])
-            np.save(os.path.join(OUTPUT_DIR, "years_processed.npy"), np.array(all_years))
-
-    # Финальное сохранение всех годов
-    all_years = sorted(processed_years + years_processed)
-    np.save(os.path.join(OUTPUT_DIR, "years_processed.npy"), np.array(all_years))
-
-    print(f"Обработка изображений завершена. Всего обработано {len(all_years)} лет.")
-    return all_years, all_positions
+    print(f"Обработка изображений завершена. Всего обработано {len(processed_years)} лет.")
 
 
-def phase2_build_training_data():
-    """Фаза 2: Создание обучающих данных с анализом изменений классов"""
-    print("Фаза 2: Создание обучающих данных и анализ изменений...")
-
-    train_data_dir = os.path.join(OUTPUT_DIR, "train_data")
-
-    if not os.path.exists(os.path.join(OUTPUT_DIR, "years_processed.npy")):
-        raise FileNotFoundError("Не найдены результаты предварительной обработки. Сначала выполните фазу 1.")
-
-    years_processed = np.load(os.path.join(OUTPUT_DIR, "years_processed.npy"))
-
-    all_positions = {}
-    for year in years_processed:
-        positions_file = os.path.join(PATCHES_DIR, str(year), "positions.npy")
-        if os.path.exists(positions_file):
-            all_positions[year] = np.load(positions_file)
-        else:
-            print(f"Предупреждение: файл позиций не найден для {year} года")
-
-    # Счетчики для статистики
-    total_sequences = 0
-    changed_sequences = 0
-    class_changes = {}  # Словарь для отслеживания изменений между классами
-    class_frequencies = {}  # Частота встречаемости каждого класса
-
-    # Создаем директорию для анализа
-    analysis_dir = os.path.join(OUTPUT_DIR, "analysis")
-    os.makedirs(analysis_dir, exist_ok=True)
-
-    print("Анализ изменений классов в последовательностях...")
-
-    sorted_years = sorted(years_processed)
-
-    # Строим обучающие данные и собираем статистику
-    for i in range(len(sorted_years) - SEQUENCE_LENGTH):
-        year_sequence = sorted_years[i:i + SEQUENCE_LENGTH + 1]
-        seq_idx = i
-
-        print(f"Обработка последовательности лет {year_sequence}")
-
-        # Позиции из первого года в последовательности
-        positions = all_positions[year_sequence[0]]
-
-        seq_dir = os.path.join(train_data_dir, f"seq_{seq_idx}")
-        os.makedirs(seq_dir, exist_ok=True)
-
-        # Счетчики для текущей последовательности лет
-        sequence_total = 0
-        sequence_changed = 0
-
-        for pos_idx, pos in enumerate(tqdm(positions, desc=f"Обработка патчей для {year_sequence}")):
-            y_start, x_start = pos
-
-            # Проверяем наличие всех файлов в последовательности
-            sequence_valid = True
-            for year in year_sequence:
-                patch_path = os.path.join(PATCHES_DIR, str(year), f"{year}_{y_start}_{x_start}.npy")
-                if not os.path.exists(patch_path):
-                    sequence_valid = False
-                    break
-
-            if not sequence_valid:
+def phase2_build_training_dataset():
+    """Фаза 2: Создание объединенного набора данных для обучения и валидации"""
+    print("Фаза 2: Создание объединенного датасета...")
+    
+    train_dataset_file = os.path.join(OUTPUT_DIR, "train_dataset.npz")
+    val_dataset_file = os.path.join(OUTPUT_DIR, "val_dataset.npz")
+    
+    if os.path.exists(train_dataset_file) and os.path.exists(val_dataset_file):
+        print("Датасеты уже существуют. Пропускаем фазу 2.")
+        return train_dataset_file, val_dataset_file
+    
+    # Путь к директории с последовательностями
+    sequences_dir = os.path.join(OUTPUT_DIR, "sequences")
+    
+    if not os.path.exists(sequences_dir):
+        raise FileNotFoundError(f"Директория {sequences_dir} не найдена. Сначала выполните фазу 1.")
+    
+    # Находим все файлы с последовательностями
+    chunk_files = [f for f in os.listdir(sequences_dir) if f.startswith("sequence_chunk_") and f.endswith(".npz")]
+    
+    if not chunk_files:
+        raise FileNotFoundError(f"В директории {sequences_dir} не найдены файлы с последовательностями.")
+    
+    print(f"Найдено {len(chunk_files)} файлов с последовательностями")
+    
+    # Перемешиваем файлы и разделяем на обучающую и валидационную выборки
+    np.random.seed(42)
+    np.random.shuffle(chunk_files)
+    
+    # Используем 20% для валидации
+    val_size = int(0.2 * len(chunk_files))
+    val_files = chunk_files[:val_size]
+    train_files = chunk_files[val_size:]
+    
+    print(f"Разделение: {len(train_files)} файлов для обучения, {len(val_files)} для валидации")
+    
+    # Функция для объединения данных из нескольких файлов
+    def combine_chunks(file_list):
+        all_sequences = []
+        all_targets = []
+        all_metadata = []
+        
+        for filename in tqdm(file_list, desc="Объединение чанков"):
+            try:
+                data = np.load(os.path.join(sequences_dir, filename), allow_pickle=True)
+                
+                sequences = data['sequences']
+                targets = data['targets']
+                metadata = data['metadata']
+                
+                all_sequences.append(sequences)
+                all_targets.append(targets)
+                all_metadata.extend(metadata)
+            except Exception as e:
+                print(f"Ошибка при загрузке файла {filename}: {e}")
                 continue
+        
+        # Объединяем все в единые массивы
+        combined_sequences = np.vstack(all_sequences) if all_sequences else np.array([])
+        combined_targets = np.concatenate(all_targets) if all_targets else np.array([])
+        
+        return combined_sequences, combined_targets, all_metadata
+    
+    # Создаем обучающий датасет
+    print("Создание обучающего датасета...")
+    train_sequences, train_targets, train_metadata = combine_chunks(train_files)
+    
+    # Сохраняем обучающий датасет
+    print(f"Сохранение обучающего датасета ({len(train_sequences)} последовательностей)...")
+    np.savez_compressed(
+        train_dataset_file,
+        sequences=train_sequences,
+        targets=train_targets,
+        metadata=train_metadata
+    )
+    
+    # Создаем валидационный датасет
+    print("Создание валидационного датасета...")
+    val_sequences, val_targets, val_metadata = combine_chunks(val_files)
+    
+    # Сохраняем валидационный датасет
+    print(f"Сохранение валидационного датасета ({len(val_sequences)} последовательностей)...")
+    np.savez_compressed(
+        val_dataset_file,
+        sequences=val_sequences,
+        targets=val_targets,
+        metadata=val_metadata
+    )
+    
+    print(f"Датасеты успешно созданы и сохранены:")
+    print(f"  - Обучающий: {train_dataset_file} ({len(train_sequences)} последовательностей)")
+    print(f"  - Валидационный: {val_dataset_file} ({len(val_sequences)} последовательностей)")
+    
+    return train_dataset_file, val_dataset_file
 
-            # Последовательность валидна, увеличиваем счетчик
-            total_sequences += 1
-            sequence_total += 1
-
-            # Загружаем начальный и конечный патч
-            first_year = year_sequence[0]
-            last_year = year_sequence[-1]
-
-            first_patch_path = os.path.join(PATCHES_DIR, str(first_year), f"{first_year}_{y_start}_{x_start}.npy")
-            last_patch_path = os.path.join(PATCHES_DIR, str(last_year), f"{last_year}_{y_start}_{x_start}.npy")
-
-            first_patch = np.load(first_patch_path)
-            last_patch = np.load(last_patch_path)
-
-            # Определяем центральный пиксель
-            center_y, center_x = PATCH_SIZE // 2, PATCH_SIZE // 2
-            first_class = first_patch[center_y, center_x]
-            last_class = last_patch[center_y, center_x]
-
-            # Обновляем частоту встречаемости классов
-            class_frequencies[first_class] = class_frequencies.get(first_class, 0) + 1
-            class_frequencies[last_class] = class_frequencies.get(last_class, 0) + 1
-
-            # Проверяем, изменился ли класс
-            if first_class != last_class:
-                changed_sequences += 1
-                sequence_changed += 1
-
-                # Отслеживаем изменения между конкретными классами
-                class_pair = (first_class, last_class)
-                class_changes[class_pair] = class_changes.get(class_pair, 0) + 1
-
-            # Загружаем всю последовательность патчей и сохраняем
-            sequence = []
-            for year in year_sequence[:-1]:
-                patch_path = os.path.join(PATCHES_DIR, str(year), f"{year}_{y_start}_{x_start}.npy")
-                patch = np.load(patch_path)
-                sequence.append(patch)
-
-            target_year = year_sequence[-1]
-            target_path = os.path.join(PATCHES_DIR, str(target_year), f"{target_year}_{y_start}_{x_start}.npy")
-            target_patch = np.load(target_path)
-            target_class = target_patch[center_y, center_x]
-
-            seq_filename = f"seq_{pos_idx}.npy"
-            target_filename = f"target_{pos_idx}.npy"
-            change_filename = f"change_{pos_idx}.npy"  # Добавляем информацию об изменении
-
-            np.save(os.path.join(seq_dir, seq_filename), np.array(sequence))
-            np.save(os.path.join(seq_dir, target_filename), target_class)
-            # Сохраняем информацию, изменился ли класс (1 - да, 0 - нет)
-            np.save(os.path.join(seq_dir, change_filename), 1 if first_class != last_class else 0)
-
-            # Очищаем память каждые 1000 патчей
-            if pos_idx % 1000 == 0:
-                gc.collect()
-
-        # Выводим статистику для текущей последовательности лет
-        if sequence_total > 0:
-            change_percent = (sequence_changed / sequence_total) * 100
-            print(
-                f"Последовательность лет {year_sequence}: найдено {sequence_changed} изменений из {sequence_total} патчей ({change_percent:.2f}%)")
-
-    # Выводим общую статистику
-    if total_sequences > 0:
-        change_percent = (changed_sequences / total_sequences) * 100
-        print(f"\nОбщая статистика:")
-        print(f"Всего последовательностей: {total_sequences}")
-        print(f"Последовательностей с изменениями: {changed_sequences} ({change_percent:.2f}%)")
-
-        # Сохраняем статистику в файл
-        stats_file = os.path.join(analysis_dir, "change_statistics.txt")
-        with open(stats_file, 'w') as f:
-            f.write(f"Общая статистика:\n")
-            f.write(f"Всего последовательностей: {total_sequences}\n")
-            f.write(f"Последовательностей с изменениями: {changed_sequences} ({change_percent:.2f}%)\n\n")
-
-            f.write(f"Частота встречаемости классов:\n")
-            for cls, count in sorted(class_frequencies.items(), key=lambda x: x[1], reverse=True):
-                f.write(f"Класс {cls}: {count} ({count / sum(class_frequencies.values()) * 100:.2f}%)\n")
-
-            f.write(f"\nНаиболее частые изменения классов:\n")
-            for (cls1, cls2), count in sorted(class_changes.items(), key=lambda x: x[1], reverse=True)[:20]:
-                f.write(
-                    f"Класс {cls1} -> Класс {cls2}: {count} ({count / changed_sequences * 100:.2f}% от всех изменений)\n")
-
-        print(f"Статистика сохранена в {stats_file}")
-
-        # Создаем визуализации
-        try:
-            # Круговая диаграмма частоты классов
-            plt.figure(figsize=(12, 8))
-            classes = list(class_frequencies.keys())
-            values = list(class_frequencies.values())
-
-            # Отображаем только топ-10 классов для лучшей читаемости
-            if len(classes) > 10:
-                top_indices = np.argsort(values)[-10:]
-                other_sum = sum(values) - sum(np.array(values)[top_indices])
-                classes = [classes[i] for i in top_indices] + ['Другие']
-                values = [values[i] for i in top_indices] + [other_sum]
-
-            plt.pie(values, labels=classes, autopct='%1.1f%%', shadow=True, startangle=90)
-            plt.axis('equal')
-            plt.title('Распределение классов')
-            plt.savefig(os.path.join(analysis_dir, "class_distribution.png"))
-            plt.close()
-
-            # Гистограмма изменений классов
-            plt.figure(figsize=(15, 10))
-            top_changes = sorted(class_changes.items(), key=lambda x: x[1], reverse=True)[:15]
-            labels = [f"{c1}->{c2}" for (c1, c2), _ in top_changes]
-            counts = [count for _, count in top_changes]
-
-            plt.bar(labels, counts)
-            plt.xticks(rotation=45, ha='right')
-            plt.xlabel('Изменение класса')
-            plt.ylabel('Количество')
-            plt.title('Топ-15 наиболее частых изменений классов')
-            plt.tight_layout()
-            plt.savefig(os.path.join(analysis_dir, "class_changes.png"))
-            plt.close()
-
-            print(f"Графики сохранены в директории {analysis_dir}")
-        except Exception as e:
-            print(f"Ошибка при создании визуализаций: {e}")
-
-    print("Создание обучающих данных завершено")
-    return train_data_dir
+class SequenceDataGenerator:
+    """Генератор данных для работы с объединенным датасетом последовательностей"""
+    
+    def __init__(self, dataset_file, batch_size=32, num_classes=44, shuffle=True):
+        """
+        Инициализирует генератор данных
+        
+        Parameters:
+        -----------
+        dataset_file : str
+            Путь к файлу с объединенным датасетом (.npz)
+        batch_size : int
+            Размер батча
+        num_classes : int
+            Количество классов для one-hot кодирования
+        shuffle : bool
+            Перемешивать ли данные перед выдачей батчей
+        """
+        self.dataset_file = dataset_file
+        self.batch_size = batch_size
+        self.num_classes = num_classes
+        self.shuffle = shuffle
+        
+        # Загружаем датасет
+        print(f"Загрузка датасета из {dataset_file}...")
+        dataset = np.load(dataset_file, allow_pickle=True)
+        
+        self.sequences = dataset['sequences']
+        self.targets = dataset['targets']
+        self.metadata = dataset['metadata'] if 'metadata' in dataset else None
+        
+        self.num_samples = len(self.sequences)
+        print(f"Загружено {self.num_samples} последовательностей")
+        
+        # Индексы для перемешивания
+        self.indices = np.arange(self.num_samples)
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+        
+        # Количество батчей
+        self.num_batches = int(np.ceil(self.num_samples / self.batch_size))
+        
+    def __len__(self):
+        """Возвращает количество батчей в генераторе"""
+        return self.num_batches
+    
+    def on_epoch_end(self):
+        """Вызывается в конце каждой эпохи"""
+        if self.shuffle:
+            np.random.shuffle(self.indices)
+    
+    def __iter__(self):
+        """Делает класс итерируемым"""
+        self.current_batch = 0
+        return self
+    
+    def __next__(self):
+        """Возвращает следующий батч"""
+        if self.current_batch >= self.num_batches:
+            self.on_epoch_end()
+            raise StopIteration
+        
+        # Индексы для текущего батча
+        batch_indices = self.indices[self.current_batch * self.batch_size:
+                                     (self.current_batch + 1) * self.batch_size]
+        
+        # Получаем данные по индексам
+        batch_sequences = self.sequences[batch_indices]
+        batch_targets = self.targets[batch_indices]
+        
+        # Преобразуем в one-hot
+        batch_sequences_one_hot = np.array([
+            [to_one_hot(patch, self.num_classes) for patch in sequence]
+            for sequence in batch_sequences
+        ])
+        
+        batch_targets_one_hot = np.zeros((len(batch_targets), self.num_classes))
+        for i, target in enumerate(batch_targets):
+            batch_targets_one_hot[i, target] = 1
+        
+        self.current_batch += 1
+        return batch_sequences_one_hot, batch_targets_one_hot
+    
+    def generate(self):
+        """Генератор для бесконечной выдачи батчей (для model.fit)"""
+        while True:
+            for batch_sequences, batch_targets in self:
+                yield batch_sequences, batch_targets
 
 
 def main(phase=0, start_phase=1, end_phase=6, use_separated_model=True):
-    if phase > 0:
-        if phase == 1:
-            phase1_preprocess_images()
-        elif phase == 2:
-            phase2_build_training_data()
+    if phase == 0:
+        phase0_imeges_to_maps()
+    elif phase == 1:
+        phase1_preprocess_images()
+    elif phase == 2:
+        phase2_build_training_dataset()
 
-        else:
-            print(f"Неизвестная фаза: {phase}")
     else:
-        # Выполняем все фазы последовательно
-        for phase in range(start_phase, end_phase + 1):
-            print(f"\n{'=' * 20} Выполнение фазы {phase} {'=' * 20}\n")
-
-            if phase == 1:
-                phase1_preprocess_images()
-            elif phase == 2:
-                phase2_build_training_data()
-
-            gc.collect()
+        print(f"Неизвестная фаза: {phase}")
 
     print("\nВыполнение завершено!")
 
 
 if __name__ == '__main__':
     freeze_support()
-    main(1, use_separated_model=True)  # Использовать раздельное обучение
+    main(1, use_separated_model=True)
