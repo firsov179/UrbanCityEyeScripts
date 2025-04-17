@@ -32,6 +32,7 @@ SEQUENCE_LENGTH = 5
 BATCH_SIZE = 32
 MAX_WORKERS = 10
 SAMPLE_INTERVAL = 5
+NUM_CLASSES = 44
 
 BASE_DIR = 'C:\HSE\Okit\diplom3'
 PATCHES_DIR = 'C:\HSE\Okit\diplom3\patches'
@@ -158,6 +159,7 @@ def process_chunk(args):
     chunk_coords, imgs, height, width, patch_size, years = args
 
     saved_positions = []
+    changed_count = 0
     
     sequences_dir = os.path.join(OUTPUT_DIR, "sequences")
     os.makedirs(sequences_dir, exist_ok=True)
@@ -165,59 +167,64 @@ def process_chunk(args):
     chunk_sequences = []
     chunk_targets = []
     chunk_metadata = []
-    chunk_changed = []  # Добавим для отслеживания
     
     for center_y, center_x in chunk_coords:
-        # Вычисляем верхний левый угол патча, чтобы (center_y, center_x) был центром
-        y_start = center_y - patch_size // 2
-        x_start = center_x - patch_size // 2
+        # Вычисляем верхний левый угол патча так, чтобы (center_y, center_x) был центром
+        half_patch = patch_size // 2
+        y_start = center_y - half_patch
+        x_start = center_x - half_patch
         
-        # Проверяем, что патч в пределах изображения
-        valid_sequence = True
+        # Проверка границ изображения
         if (y_start < 0 or y_start + patch_size > height or 
             x_start < 0 or x_start + patch_size > width):
-            valid_sequence = False
+            continue
         
+        # Проверка для всех изображений
+        valid_sequence = True
         for img in imgs:
-            if not valid_sequence or (y_start + patch_size > img.shape[0] or 
-                x_start + patch_size > img.shape[1]):
+            if (y_start + patch_size > img.shape[0] or x_start + patch_size > img.shape[1]):
                 valid_sequence = False
                 break
         
         if not valid_sequence:
             continue
             
+        # Извлекаем последовательность патчей
         sequence = []
         for i in range(len(years) - 1):  # Все кроме последней карты
-            year = years[i]
             patch = imgs[i][y_start:y_start + patch_size, x_start:x_start + patch_size]
             sequence.append(patch)
         
-        # Центр патча должен быть исходной координатой
+        # Получаем целевое значение и проверяем изменение
         target_value = imgs[-1][center_y, center_x]
         initial_value = imgs[0][center_y, center_x]
         
         # Определяем, изменился ли пиксель
-        changed = (initial_value != target_value)
-        chunk_changed.append(changed)
+        if initial_value != target_value:
+            changed_count += 1
         
+        # Добавляем данные
         chunk_sequences.append(np.array(sequence))
         chunk_targets.append(target_value)
         chunk_metadata.append({
             'y': center_y,
             'x': center_x,
             'years': years[:-1],
-            'target_year':  years[-1],
-            'changed': changed  # Добавляем флаг изменения в метаданные
+            'target_year': years[-1],
+            'changed': initial_value != target_value,
+            'initial_value': int(initial_value),
+            'target_value': int(target_value)
         })
         
         saved_positions.append((center_y, center_x))
     
-    # Вывод статистики для контроля
-    if chunk_changed:
-        changed_percentage = sum(chunk_changed) / len(chunk_changed) * 100
-        print(f"Процент измененных пикселей в чанке: {changed_percentage:.2f}%")
+    # Статистика для отслеживания
+    total = len(chunk_coords)
+    if total > 0:
+        changed_percent = (changed_count / total) * 100
+        print(f"Чанк: всего {total}, изменены {changed_count} ({changed_percent:.2f}%)")
     
+    # Сохраняем результаты
     if chunk_sequences:
         chunk_id = hash(tuple(sorted([(p[0], p[1]) for p in saved_positions]))) % 10000
         chunk_filename = f"sequence_chunk_{chunk_id}.npz"
@@ -226,11 +233,11 @@ def process_chunk(args):
             sequences=np.array(chunk_sequences),
             targets=np.array(chunk_targets),
             metadata=np.array(chunk_metadata, dtype=object),
-            changed=np.array(chunk_changed)  # Сохраняем для анализа
         )
         print(f"Сохранен чанк {chunk_id} с {len(chunk_sequences)} последовательностями")
 
     return saved_positions
+
 
 
 def process_maps_to_data(maps_paths, years, output_dir=PATCHES_DIR, patch_size=PATCH_SIZE):
@@ -762,15 +769,221 @@ class SequenceDataGenerator:
         for i, target in enumerate(batch_targets):
             batch_targets_one_hot[i, target] = 1
         
+        # Создаем метки для изменений
+        change_labels = []
+        for i, sequence in enumerate(batch_sequences):
+            target_class = batch_targets[i]
+            last_frame = sequence[-1]
+            center_y, center_x = PATCH_SIZE // 2, PATCH_SIZE // 2
+            last_class = last_frame[center_y, center_x]
+            
+            changed = 1.0 if last_class != target_class else 0.0
+            change_labels.append(changed)
+        
+        change_labels = np.array(change_labels).reshape(-1, 1)
+        
         self.current_batch += 1
-        return batch_sequences_one_hot, batch_targets_one_hot
+        return batch_sequences_one_hot, {
+            'change_probability': change_labels,
+            'class_probabilities': batch_targets_one_hot
+        }
     
     def generate(self):
         """Генератор для бесконечной выдачи батчей (для model.fit)"""
         while True:
-            for batch_sequences, batch_targets in self:
-                yield batch_sequences, batch_targets
+            # Перезапускаем итератор, когда он исчерпан
+            try:
+                for batch_sequences, batch_targets in self:
+                    yield batch_sequences, batch_targets
+            except StopIteration:
+                self.on_epoch_end()
+                self.current_batch = 0
 
+
+def create_integrated_model(input_shape, sequence_length, num_classes):
+    """
+    Создает интегрированную модель, включающую CNN, RF-подобный слой и LSTM.
+
+    Args:
+        input_shape: Форма входных данных для одного фрагмента (высота, ширина, каналы)
+        sequence_length: Длина временной последовательности
+        num_classes: Количество классов
+
+    Returns:
+        Модель Keras
+    """
+    # Входной слой для последовательности фрагментов
+    input_sequence = Input(shape=(sequence_length,) + input_shape)
+
+    # CNN для извлечения признаков из каждого фрагмента последовательности
+    cnn_model = tf.keras.Sequential([
+        Conv2D(16, (3, 3), padding='same', activation='relu'),
+        BatchNormalization(),
+        MaxPooling2D(pool_size=(2, 2)),
+        Conv2D(16, (3, 3), padding='same', activation='relu'),
+        BatchNormalization(),
+        MaxPooling2D(pool_size=(2, 2)),
+        Flatten(),
+        Dense(4, activation='relu')
+    ])
+
+    # TimeDistributed обертка применяет CNN к каждому фрагменту последовательности
+    time_distributed_cnn = TimeDistributed(cnn_model)(input_sequence)
+
+    # LSTM для анализа временной последовательности
+    lstm_out = LSTM(64, return_sequences=False)(time_distributed_cnn)
+    lstm_out = Dropout(0.3)(lstm_out)
+
+    change_probability = Dense(1, activation='sigmoid', name='change_probability')(lstm_out)
+
+    # Слой для предсказания класса
+    class_probabilities = Dense(64, activation='relu')(lstm_out)
+    class_probabilities = BatchNormalization()(class_probabilities)
+    class_probabilities = Dense(num_classes, activation='softmax', name='class_probabilities')(class_probabilities)
+
+    # Создаем модель с несколькими выходами
+    model = Model(inputs=input_sequence, outputs=[change_probability, class_probabilities])
+
+    # Компилируем модель с разными функциями потерь
+    model.compile(
+        optimizer=Adam(learning_rate=0.001),
+        loss={
+            'change_probability': 'binary_crossentropy',
+            'class_probabilities': 'categorical_crossentropy'
+        },
+        metrics={
+            'change_probability': 'accuracy',
+            'class_probabilities': 'accuracy'
+        },
+        loss_weights={
+            'change_probability': 0.3,  # Меньший вес для определения изменения
+            'class_probabilities': 0.7  # Больший вес для предсказания класса
+        }
+    )
+
+    return model
+
+
+def plot_training_history(history):
+    """Визуализирует историю обучения модели"""
+    # Создаем директорию для графиков, если её нет
+    plots_dir = os.path.join(OUTPUT_DIR, 'plots')
+    os.makedirs(plots_dir, exist_ok=True)
+    
+    # Строим график потерь
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(history.history['loss'], label='Train Loss')
+    if 'val_loss' in history.history:
+        plt.plot(history.history['val_loss'], label='Validation Loss')
+    plt.title('Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    # Строим график точности для основной задачи (классификация)
+    plt.subplot(1, 2, 2)
+    plt.plot(history.history['class_probabilities_accuracy'], label='Train Accuracy')
+    if 'val_class_probabilities_accuracy' in history.history:
+        plt.plot(history.history['val_class_probabilities_accuracy'], label='Validation Accuracy')
+    plt.title('Class Prediction Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(plots_dir, 'training_history.png'), dpi=300)
+    
+    # Строим график точности для предсказания изменений
+    plt.figure(figsize=(10, 5))
+    plt.plot(history.history['change_probability_accuracy'], label='Train Accuracy')
+    if 'val_change_probability_accuracy' in history.history:
+        plt.plot(history.history['val_change_probability_accuracy'], label='Validation Accuracy')
+    plt.title('Change Prediction Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.grid(True, linestyle='--', alpha=0.6)
+    plt.savefig(os.path.join(plots_dir, 'change_prediction_history.png'), dpi=300)
+    
+    plt.close('all')
+
+
+def phase3_train_model():
+    """Фаза 3: Обучение модели"""
+    print("Фаза 3: Обучение модели...")
+    
+    model_path = os.path.join(MODELS_DIR, 'infrastructure_model.h5')
+    if os.path.exists(model_path):
+        print(f"Модель уже обучена и сохранена в {model_path}. Пропускаем фазу 3.")
+        # Если нужно переобучить, раскомментируйте следующую строку
+        # os.remove(model_path)
+    
+    # Пути к датасетам
+    train_dataset_file = os.path.join(OUTPUT_DIR, "train_dataset.npz")
+    val_dataset_file = os.path.join(OUTPUT_DIR, "val_dataset.npz")
+    
+    if not os.path.exists(train_dataset_file):
+        raise FileNotFoundError(f"Не найден файл обучающего датасета: {train_dataset_file}")
+    
+    if not os.path.exists(val_dataset_file):
+        print(f"Предупреждение: файл валидационного датасета не найден: {val_dataset_file}")
+        val_dataset_file = None
+    
+    # Создаем генераторы данных
+    train_gen = SequenceDataGenerator(train_dataset_file, batch_size=BATCH_SIZE)
+    val_gen = SequenceDataGenerator(val_dataset_file, batch_size=BATCH_SIZE) if val_dataset_file else None
+    
+    # Создаем модель
+    input_shape = (PATCH_SIZE, PATCH_SIZE, NUM_CLASSES)
+    model = create_integrated_model(input_shape, SEQUENCE_LENGTH, NUM_CLASSES)
+    
+    # Выводим информацию о модели
+    model.summary()
+    
+    # Настраиваем обратные вызовы
+    callbacks = [
+        EarlyStopping(monitor='val_loss' if val_gen else 'loss', patience=5, restore_best_weights=True),
+        ModelCheckpoint(model_path, save_best_only=True),
+        # Сохранение модели после каждой эпохи
+        ModelCheckpoint(
+            os.path.join(MODELS_DIR, 'infrastructure_model_epoch_{epoch:02d}.h5'), 
+            save_freq='epoch'
+        ),
+        # Очистка памяти каждые 50 батчей
+        tf.keras.callbacks.LambdaCallback(
+            on_batch_end=lambda batch, logs: gc.collect() if batch % 50 == 0 else None
+        )
+    ]
+    
+    # Определяем количество шагов для каждой эпохи
+    steps_per_epoch = min(2000, len(train_gen))
+    validation_steps = min(500, len(val_gen)) if val_gen else None
+    
+    print(f"Шагов на эпоху: {steps_per_epoch}, валидационных шагов: {validation_steps}")
+    
+    # Обучаем модель
+    history = model.fit(
+        train_gen.generate(),
+        steps_per_epoch=steps_per_epoch,
+        validation_data=val_gen.generate() if val_gen else None,
+        validation_steps=validation_steps,
+        epochs=30,  # Можно настроить
+        callbacks=callbacks,
+        verbose=1
+    )
+    
+    # Сохраняем историю обучения
+    history_file = os.path.join(OUTPUT_DIR, 'training_history.npy')
+    np.save(history_file, history.history)
+    
+    # Визуализируем результаты обучения
+    plot_training_history(history)
+    
+    print(f"Модель обучена и сохранена в {model_path}")
+    return model, history
 
 def main(phase=0, start_phase=1, end_phase=6, use_separated_model=True):
     if phase == 0:
@@ -779,6 +992,8 @@ def main(phase=0, start_phase=1, end_phase=6, use_separated_model=True):
         phase1_preprocess_images()
     elif phase == 2:
         phase2_build_training_dataset()
+    elif phase == 3:
+        phase3_train_model()
 
     else:
         print(f"Неизвестная фаза: {phase}")
@@ -788,4 +1003,4 @@ def main(phase=0, start_phase=1, end_phase=6, use_separated_model=True):
 
 if __name__ == '__main__':
     freeze_support()
-    main(1, use_separated_model=True)
+    main(3, use_separated_model=True)
